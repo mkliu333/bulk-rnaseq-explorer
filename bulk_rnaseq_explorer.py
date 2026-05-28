@@ -1,15 +1,15 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_7
+Version: bulk_rnaseq_explorer_v1_8
 
-Scope for v1.7:
+Scope for v1.8:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
 - Merge duplicated processed gene symbols by summing raw counts.
 - Produce a clean processed count matrix for future QC.
-- Optimize QC grouping and configurable Plotly bar plots.
-- Cache QC summary and plot data to reduce Streamlit rerun cost.
+- Optimize Quality Control dataset summary and QC grouping editor.
+- Use immediate session-state updates for stable sample assignment filtering.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -43,7 +43,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_7"
+APP_VERSION = "bulk_rnaseq_explorer_v1_8"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -97,11 +97,12 @@ def init_session_state() -> None:
         "active_qc_grouping_set": None,
         "current_qc_group_editor": {
             "grouping_set_name": "QC grouping 1",
-            "groups": {
-                "Group 1": [],
-                "Group 2": [],
-            },
+            "groups": [
+                {"id": "group_1", "name": "Group 1", "samples": []},
+                {"id": "group_2", "name": "Group 2", "samples": []},
+            ],
         },
+        "qc_group_id_counter": 2,
         "qc_plot_settings": default_qc_plot_settings(),
         "qc_export_bytes": {},
         "qc_summary": None,
@@ -134,6 +135,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("qc_summary", None)
     st.session_state.setdefault("qc_summary_signature", None)
     st.session_state.setdefault("qc_plot_data_cache", {})
+    st.session_state.setdefault("qc_group_id_counter", 2)
 
 
 def default_conversion_summary() -> dict[str, Any]:
@@ -161,8 +163,12 @@ def clear_count_matrix_state() -> None:
     st.session_state["active_qc_grouping_set"] = None
     st.session_state["current_qc_group_editor"] = {
         "grouping_set_name": "QC grouping 1",
-        "groups": {"Group 1": [], "Group 2": []},
+        "groups": [
+            {"id": "group_1", "name": "Group 1", "samples": []},
+            {"id": "group_2", "name": "Group 2", "samples": []},
+        ],
     }
+    st.session_state["qc_group_id_counter"] = 2
     st.session_state["qc_plot_settings"] = default_qc_plot_settings()
     st.session_state["qc_export_bytes"] = {}
     st.session_state["qc_summary"] = None
@@ -663,61 +669,118 @@ def clear_qc_plot_cache(plot_id: str | None = None) -> None:
 
 def default_qc_group_editor(sample_columns: list[str]) -> dict[str, Any]:
     """Build a default QC grouping draft."""
-    midpoint = max(1, len(sample_columns) // 2)
     return {
         "grouping_set_name": "QC grouping 1",
-        "groups": {
-            "Group 1": sample_columns[:midpoint],
-            "Group 2": sample_columns[midpoint:],
-        },
+        "groups": [
+            {"id": "group_1", "name": "Group 1", "samples": []},
+            {"id": "group_2", "name": "Group 2", "samples": []},
+        ],
     }
 
 
 def normalize_qc_group_editor(editor: dict[str, Any] | None, sample_columns: list[str]) -> dict[str, Any]:
-    """Keep the grouping draft compatible with current samples."""
-    if not isinstance(editor, dict) or not isinstance(editor.get("groups"), dict):
+    """Keep the grouping draft compatible with current samples and stable group IDs."""
+    if not isinstance(editor, dict):
         return default_qc_group_editor(sample_columns)
     sample_set = set(sample_columns)
-    normalized_groups: dict[str, list[str]] = {}
-    for index, (group_name, samples) in enumerate(editor.get("groups", {}).items(), start=1):
-        clean_name = str(group_name).strip() or f"Group {index}"
+    raw_groups = editor.get("groups")
+    normalized_groups: list[dict[str, Any]] = []
+
+    if isinstance(raw_groups, dict):
+        iterable_groups = [
+            {"id": f"group_{index}", "name": group_name, "samples": samples}
+            for index, (group_name, samples) in enumerate(raw_groups.items(), start=1)
+        ]
+    elif isinstance(raw_groups, list):
+        iterable_groups = raw_groups
+    else:
+        iterable_groups = []
+
+    used_ids: set[str] = set()
+    for index, group in enumerate(iterable_groups, start=1):
+        if not isinstance(group, dict):
+            continue
+        group_id = str(group.get("id") or f"group_{index}").strip() or f"group_{index}"
+        if group_id in used_ids:
+            group_id = f"group_{index}"
+        used_ids.add(group_id)
+        clean_name = str(group.get("name") or f"Group {index}").strip() or f"Group {index}"
+        samples = group.get("samples", [])
         unique_samples = []
         for sample in samples if isinstance(samples, list) else []:
             sample_text = str(sample)
             if sample_text in sample_set and sample_text not in unique_samples:
                 unique_samples.append(sample_text)
-        normalized_groups[clean_name] = unique_samples
+        normalized_groups.append({"id": group_id, "name": clean_name, "samples": unique_samples})
+
     while len(normalized_groups) < 2:
-        normalized_groups[f"Group {len(normalized_groups) + 1}"] = []
+        next_index = len(normalized_groups) + 1
+        normalized_groups.append({"id": f"group_{next_index}", "name": f"Group {next_index}", "samples": []})
+
+    max_numeric_id = 0
+    for group in normalized_groups:
+        match = re.match(r"^group_(\d+)$", str(group["id"]))
+        if match:
+            max_numeric_id = max(max_numeric_id, int(match.group(1)))
+    st.session_state["qc_group_id_counter"] = max(int(st.session_state.get("qc_group_id_counter", 2)), max_numeric_id, 2)
+
     return {
         "grouping_set_name": str(editor.get("grouping_set_name") or "QC grouping 1"),
         "groups": normalized_groups,
     }
 
 
-def get_unassigned_samples(groups: dict[str, list[str]], sample_columns: list[str]) -> list[str]:
+def get_editor_groups_as_dict(groups_or_editor: Any) -> dict[str, list[str]]:
+    """Convert editor groups or saved grouping dict to {group_name: samples}."""
+    if isinstance(groups_or_editor, dict) and isinstance(groups_or_editor.get("groups"), list):
+        return {
+            str(group.get("name", "")).strip(): list(group.get("samples", []))
+            for group in groups_or_editor["groups"]
+            if str(group.get("name", "")).strip()
+        }
+    if isinstance(groups_or_editor, list):
+        return {
+            str(group.get("name", "")).strip(): list(group.get("samples", []))
+            for group in groups_or_editor
+            if isinstance(group, dict) and str(group.get("name", "")).strip()
+        }
+    if isinstance(groups_or_editor, dict):
+        return {
+            str(group_name).strip(): list(samples)
+            for group_name, samples in groups_or_editor.items()
+            if str(group_name).strip() and isinstance(samples, list)
+        }
+    return {}
+
+
+def get_unassigned_samples(groups_or_editor: Any, sample_columns: list[str]) -> list[str]:
     """Return samples not assigned to any QC group."""
+    groups = get_editor_groups_as_dict(groups_or_editor)
     assigned = {sample for samples in groups.values() for sample in samples}
     return [sample for sample in sample_columns if sample not in assigned]
 
 
-def get_assigned_samples_by_group(groups: dict[str, list[str]]) -> dict[str, set[str]]:
+def get_assigned_samples_by_group(groups_or_editor: Any) -> dict[str, set[str]]:
     """Return selected samples for each QC group as sets."""
+    groups = get_editor_groups_as_dict(groups_or_editor)
     return {group_name: set(samples) for group_name, samples in groups.items()}
 
 
 def get_available_samples_for_group(
-    group_name: str,
-    groups: dict[str, list[str]],
+    group_id: str,
+    editor: dict[str, Any],
     sample_columns: list[str],
 ) -> list[str]:
     """Return multiselect options with samples assigned elsewhere filtered out."""
-    current_group_samples = set(groups.get(group_name, []))
+    normalized_editor = normalize_qc_group_editor(editor, sample_columns)
+    groups = normalized_editor["groups"]
+    current_group = next((group for group in groups if group["id"] == group_id), None)
+    current_group_samples = set(current_group.get("samples", []) if current_group else [])
     assigned_elsewhere = {
         sample
-        for other_group, samples in groups.items()
-        if other_group != group_name
-        for sample in samples
+        for group in groups
+        if group["id"] != group_id
+        for sample in group.get("samples", [])
     }
     return [
         sample for sample in sample_columns
@@ -725,8 +788,9 @@ def get_available_samples_for_group(
     ]
 
 
-def get_duplicate_assigned_samples(groups: dict[str, list[str]]) -> list[str]:
+def get_duplicate_assigned_samples(groups_or_editor: Any) -> list[str]:
     """Return samples assigned to more than one QC group."""
+    groups = get_editor_groups_as_dict(groups_or_editor)
     counts: dict[str, int] = {}
     for samples in groups.values():
         for sample in samples:
@@ -734,12 +798,24 @@ def get_duplicate_assigned_samples(groups: dict[str, list[str]]) -> list[str]:
     return sorted(sample for sample, count in counts.items() if count > 1)
 
 
-def validate_qc_grouping(groups: dict[str, list[str]], sample_columns: list[str]) -> list[str]:
+def validate_qc_grouping(groups_or_editor: Any, sample_columns: list[str]) -> list[str]:
     """Validate a QC grouping before saving."""
+    if isinstance(groups_or_editor, dict) and isinstance(groups_or_editor.get("groups"), list):
+        group_names = [str(group.get("name", "")).strip() for group in groups_or_editor["groups"]]
+    elif isinstance(groups_or_editor, list):
+        group_names = [str(group.get("name", "")).strip() for group in groups_or_editor if isinstance(group, dict)]
+    elif isinstance(groups_or_editor, dict):
+        group_names = [str(group_name).strip() for group_name in groups_or_editor]
+    else:
+        group_names = []
+    groups = get_editor_groups_as_dict(groups_or_editor)
     errors = []
-    if not groups:
-        errors.append("At least one group is required.")
-    duplicate_group_names = len(groups) != len({name.strip() for name in groups})
+    if len(group_names) < 2:
+        errors.append("At least two groups are required.")
+    blank_group_names = [name for name in group_names if not name.strip()]
+    if blank_group_names:
+        errors.append("Group names cannot be blank.")
+    duplicate_group_names = len(group_names) != len({name for name in group_names if name})
     if duplicate_group_names:
         errors.append("Group names must be unique.")
     duplicates = get_duplicate_assigned_samples(groups)
@@ -752,35 +828,86 @@ def validate_qc_grouping(groups: dict[str, list[str]], sample_columns: list[str]
     return errors
 
 
-def save_qc_grouping_set(grouping_name: str, groups: dict[str, list[str]]) -> str:
+def save_qc_grouping_set(grouping_name: str, groups_or_editor: Any) -> str:
     """Persist a QC grouping set and make it active."""
     clean_name = grouping_name.strip() or "QC grouping 1"
-    st.session_state["qc_grouping_sets"][clean_name] = {
-        group.strip(): list(samples) for group, samples in groups.items() if group.strip()
-    }
+    st.session_state["qc_grouping_sets"][clean_name] = get_editor_groups_as_dict(groups_or_editor)
     st.session_state["active_qc_grouping_set"] = clean_name
     clear_qc_plot_cache()
     reset_analysis_state()
     return clean_name
 
 
-def add_qc_group_to_editor(sample_columns: list[str]) -> None:
-    """Add one empty group to the QC grouping draft."""
-    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
-    groups = editor["groups"]
-    next_index = len(groups) + 1
-    while f"Group {next_index}" in groups:
-        next_index += 1
-    groups[f"Group {next_index}"] = []
+def _clear_qc_group_widget_keys(group_id: str | None = None) -> None:
+    """Clear grouping editor widget keys so reset/remove actions do not leave stale UI state."""
+    prefixes = ["qc_grouping_set_name_input"]
+    if group_id is None:
+        prefixes.extend(["qc_group_name_input_", "qc_group_samples_input_"])
+    else:
+        prefixes.extend([f"qc_group_name_input_{group_id}", f"qc_group_samples_input_{group_id}"])
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in prefixes):
+            st.session_state.pop(key, None)
+
+
+def update_qc_grouping_name_from_widget() -> None:
+    """Sync the grouping set name widget into the editor draft."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), st.session_state.get("sample_columns", []))
+    editor["grouping_set_name"] = st.session_state.get("qc_grouping_set_name_input", "QC grouping 1")
     st.session_state["current_qc_group_editor"] = editor
 
 
-def remove_qc_group_from_editor(group_name: str, sample_columns: list[str]) -> None:
+def update_qc_group_name_from_widget(group_id: str) -> None:
+    """Sync one group name widget into the editor draft."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), st.session_state.get("sample_columns", []))
+    widget_key = f"qc_group_name_input_{group_id}"
+    for group in editor["groups"]:
+        if group["id"] == group_id:
+            group["name"] = str(st.session_state.get(widget_key, group["name"])).strip() or group["name"]
+            break
+    st.session_state["current_qc_group_editor"] = editor
+
+
+def update_qc_group_samples_from_widget(group_id: str) -> None:
+    """Sync one sample multiselect widget into the editor draft."""
+    sample_columns = st.session_state.get("sample_columns", [])
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    widget_key = f"qc_group_samples_input_{group_id}"
+    selected_samples = [
+        sample for sample in st.session_state.get(widget_key, [])
+        if sample in sample_columns
+    ]
+    for group in editor["groups"]:
+        if group["id"] == group_id:
+            group["samples"] = selected_samples
+            break
+    st.session_state["current_qc_group_editor"] = editor
+
+
+def add_qc_group_to_editor(sample_columns: list[str]) -> None:
+    """Add one empty group to the QC grouping draft."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    st.session_state["qc_group_id_counter"] = int(st.session_state.get("qc_group_id_counter", 2)) + 1
+    group_id = f"group_{st.session_state['qc_group_id_counter']}"
+    group_number = len(editor["groups"]) + 1
+    editor["groups"].append({"id": group_id, "name": f"Group {group_number}", "samples": []})
+    st.session_state["current_qc_group_editor"] = editor
+
+
+def remove_qc_group_from_editor(group_id: str, sample_columns: list[str]) -> None:
     """Remove one group from the QC grouping draft."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
     if len(editor["groups"]) > 2:
-        editor["groups"].pop(group_name, None)
+        editor["groups"] = [group for group in editor["groups"] if group["id"] != group_id]
+        _clear_qc_group_widget_keys(group_id)
     st.session_state["current_qc_group_editor"] = normalize_qc_group_editor(editor, sample_columns)
+
+
+def clear_qc_group_editor(sample_columns: list[str]) -> None:
+    """Reset only the unsaved QC grouping editor draft."""
+    st.session_state["current_qc_group_editor"] = default_qc_group_editor(sample_columns)
+    st.session_state["qc_group_id_counter"] = 2
+    _clear_qc_group_widget_keys()
 
 
 def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
@@ -1043,8 +1170,12 @@ def render_upload_count_matrix_tab() -> None:
                 st.session_state["sample_columns"] = get_sample_columns(raw_counts_df, st.session_state["gene_id_column"])
                 st.session_state["current_qc_group_editor"] = {
                     "grouping_set_name": "QC grouping 1",
-                    "groups": {"Group 1": [], "Group 2": []},
+                    "groups": [
+                        {"id": "group_1", "name": "Group 1", "samples": []},
+                        {"id": "group_2", "name": "Group 2", "samples": []},
+                    ],
                 }
+                st.session_state["qc_group_id_counter"] = 2
                 st.session_state["qc_grouping_sets"] = {}
                 st.session_state["active_qc_grouping_set"] = None
                 st.session_state["qc_plot_settings"] = default_qc_plot_settings()
@@ -1073,8 +1204,12 @@ def render_upload_count_matrix_tab() -> None:
         st.session_state["sample_columns"] = get_sample_columns(raw_counts_df, selected_gene_column)
         st.session_state["current_qc_group_editor"] = {
             "grouping_set_name": "QC grouping 1",
-            "groups": {"Group 1": [], "Group 2": []},
+            "groups": [
+                {"id": "group_1", "name": "Group 1", "samples": []},
+                {"id": "group_2", "name": "Group 2", "samples": []},
+            ],
         }
+        st.session_state["qc_group_id_counter"] = 2
         st.session_state["qc_grouping_sets"] = {}
         st.session_state["active_qc_grouping_set"] = None
         st.session_state["qc_plot_settings"] = default_qc_plot_settings()
@@ -1172,74 +1307,103 @@ def make_qc_bar_plot(
     return fig
 
 
-# Streamlit reruns the script on widget changes. v1.7 minimizes expensive
-# recomputation and uses form/session-state guards, but true instant drag/drop
-# or fully local UI updates would require a custom Streamlit component or a
-# React frontend.
+# Streamlit reruns the script on widget changes. v1.8 minimizes expensive
+# recomputation and uses immediate session-state guards, but true instant
+# drag/drop or fully local UI updates would require a custom Streamlit
+# component or a React frontend.
 def render_qc_group_editor_form(sample_columns: list[str]) -> None:
-    """Render a form-based QC grouping draft editor."""
+    """Render the immediate-update QC grouping draft editor."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    if "qc_grouping_set_name_input" in st.session_state:
+        editor["grouping_set_name"] = st.session_state["qc_grouping_set_name_input"]
+    for group in editor["groups"]:
+        name_key = f"qc_group_name_input_{group['id']}"
+        samples_key = f"qc_group_samples_input_{group['id']}"
+        if name_key in st.session_state:
+            group["name"] = str(st.session_state[name_key]).strip() or group["name"]
+        if samples_key in st.session_state:
+            group["samples"] = [
+                sample for sample in st.session_state[samples_key]
+                if sample in sample_columns
+            ]
+    editor = normalize_qc_group_editor(editor, sample_columns)
     st.session_state["current_qc_group_editor"] = editor
-    group_items = list(editor["groups"].items())
 
-    with st.form("qc_group_editor_form"):
-        grouping_name = st.text_input("Grouping set name", value=editor["grouping_set_name"])
-        updated_groups: dict[str, list[str]] = {}
-        entered_group_names: list[str] = []
-        remove_index: int | None = None
-        for index, (old_group_name, current_samples) in enumerate(group_items):
-            options = get_available_samples_for_group(old_group_name, editor["groups"], sample_columns)
-            cols = st.columns([2, 5, 1])
-            with cols[0]:
-                new_group_name = st.text_input("Group name", value=old_group_name, key=f"qc_group_name_form_{index}")
-            with cols[1]:
-                selected_samples = st.multiselect(
-                    "Samples",
-                    options=options,
-                    default=[sample for sample in current_samples if sample in options],
-                    key=f"qc_group_samples_form_{index}",
-                )
-            with cols[2]:
-                if st.form_submit_button("Remove group", key=f"qc_group_remove_form_{index}", disabled=len(group_items) <= 2):
-                    remove_index = index
-            clean_name = new_group_name.strip() or old_group_name
-            entered_group_names.append(clean_name)
-            updated_groups[clean_name] = selected_samples
-
-        action_cols = st.columns([1, 5, 1])
-        with action_cols[0]:
-            save_grouping = st.form_submit_button("Save QC grouping", type="primary")
-
-    add_cols = st.columns([2, 5, 1])
-    with add_cols[2]:
-        st.button(
-            "Add group",
-            key="qc_group_add_button",
-            on_click=add_qc_group_to_editor,
-            args=(sample_columns,),
+    with st.container(border=True):
+        if "qc_grouping_set_name_input" not in st.session_state:
+            st.session_state["qc_grouping_set_name_input"] = editor["grouping_set_name"]
+        st.text_input(
+            "Grouping set name",
+            key="qc_grouping_set_name_input",
+            on_change=update_qc_grouping_name_from_widget,
         )
 
-    if save_grouping or remove_index is not None:
-        duplicate_names = sorted({name for name in entered_group_names if entered_group_names.count(name) > 1})
-        if save_grouping and duplicate_names:
-            st.error(f"Group names must be unique: {', '.join(duplicate_names)}")
-            return
-        if remove_index is not None and len(updated_groups) > 2:
-            name_to_remove = list(updated_groups.keys())[remove_index]
-            updated_groups = {name: samples for name, samples in updated_groups.items() if name != name_to_remove}
-        draft = normalize_qc_group_editor({"grouping_set_name": grouping_name, "groups": updated_groups}, sample_columns)
-        st.session_state["current_qc_group_editor"] = draft
-        if save_grouping:
-            errors = validate_qc_grouping(draft["groups"], sample_columns)
-            if errors:
-                for error in errors:
-                    st.error(error)
-                return
-            else:
-                saved_name = save_qc_grouping_set(draft["grouping_set_name"], draft["groups"])
-                st.success(f"Saved QC grouping: {saved_name}")
-        if remove_index is not None:
-            st.rerun()
+        for group in editor["groups"]:
+            group_id = group["id"]
+            name_key = f"qc_group_name_input_{group_id}"
+            samples_key = f"qc_group_samples_input_{group_id}"
+            options = get_available_samples_for_group(group_id, editor, sample_columns)
+            st.session_state[name_key] = group["name"]
+            st.session_state[samples_key] = [sample for sample in group.get("samples", []) if sample in options]
+
+            cols = st.columns([2.0, 5.0, 1.35])
+            with cols[0]:
+                st.text_input(
+                    "Group name",
+                    key=name_key,
+                    on_change=update_qc_group_name_from_widget,
+                    args=(group_id,),
+                )
+            with cols[1]:
+                st.multiselect(
+                    "Samples",
+                    options=options,
+                    key=samples_key,
+                    on_change=update_qc_group_samples_from_widget,
+                    args=(group_id,),
+                )
+            with cols[2]:
+                st.write("")
+                st.button(
+                    "Remove group",
+                    key=f"qc_group_remove_{group_id}",
+                    disabled=len(editor["groups"]) <= 2,
+                    on_click=remove_qc_group_from_editor,
+                    args=(group_id, sample_columns),
+                )
+
+        action_cols = st.columns([1.25, 1.35, 3.4, 1.05])
+        with action_cols[0]:
+            save_grouping = st.button("Save QC grouping", key="qc_group_save_button", type="primary")
+        with action_cols[1]:
+            st.button(
+                "Clear grouping info",
+                key="qc_group_clear_button",
+                on_click=clear_qc_group_editor,
+                args=(sample_columns,),
+            )
+        with action_cols[3]:
+            st.button(
+                "Add group",
+                key="qc_group_add_button",
+                on_click=add_qc_group_to_editor,
+                args=(sample_columns,),
+            )
+
+    if save_grouping:
+        update_qc_grouping_name_from_widget()
+        current_editor = normalize_qc_group_editor(st.session_state["current_qc_group_editor"], sample_columns)
+        for group in current_editor["groups"]:
+            update_qc_group_name_from_widget(group["id"])
+            update_qc_group_samples_from_widget(group["id"])
+        current_editor = normalize_qc_group_editor(st.session_state["current_qc_group_editor"], sample_columns)
+        errors = validate_qc_grouping(current_editor, sample_columns)
+        if errors:
+            for error in errors:
+                st.error(error)
+        else:
+            saved_name = save_qc_grouping_set(current_editor["grouping_set_name"], current_editor)
+            st.success(f"Saved QC grouping: {saved_name}")
 
     draft_groups = st.session_state["current_qc_group_editor"]["groups"]
     st.write("Unassigned samples:")
@@ -1250,7 +1414,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
 
 
 def render_qc_grouping_section(sample_columns: list[str]) -> None:
-    """Render the form-based QC grouping editor and saved-set controls."""
+    """Render the immediate-update QC grouping editor and saved-set controls."""
     st.markdown("### Assign QC grouping")
     render_qc_group_editor_form(sample_columns)
 
@@ -1464,8 +1628,10 @@ def render_quality_control_tab() -> None:
     display_sample_qc = sample_qc_df.copy()
     display_sample_qc["Library size"] = display_sample_qc["Library size"].round(0).astype("int64")
     display_sample_qc["Zero fraction"] = display_sample_qc["Zero fraction"].round(4)
-    display_sample_qc["Median count"] = display_sample_qc["Median count"].round(3)
     display_sample_qc["Mean count"] = display_sample_qc["Mean count"].round(3)
+    display_sample_qc = display_sample_qc[
+        ["Sample", "Library size", "Detected genes", "Zero-count genes", "Zero fraction", "Mean count"]
+    ]
     st.dataframe(display_sample_qc, use_container_width=True, hide_index=True)
 
     render_qc_grouping_section(sample_columns)
@@ -1482,6 +1648,16 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     init_session_state()
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stButton"] button {
+            white-space: nowrap;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if st.session_state["gene_map_status"].get("message") == "Not loaded":
         gene_map_df, gene_map_status = load_local_gene_map()
