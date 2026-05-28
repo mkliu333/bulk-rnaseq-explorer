@@ -1,15 +1,15 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_5
+Version: bulk_rnaseq_explorer_v1_6
 
-Scope for v1.5:
+Scope for v1.6:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
 - Merge duplicated processed gene symbols by summing raw counts.
 - Produce a clean processed count matrix for future QC.
-- Add Quality Control dataset summary and Plotly bar plots.
-- Add multiselect-based QC grouping for stable sample/group QC views.
+- Add Quality Control dataset summary and configurable Plotly bar plots.
+- Add form-based QC grouping editor and old-HTML-style QC plot controls.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -23,7 +23,8 @@ Optional for faster gene-map cache:
 pip install pyarrow
 
 Explicitly out of scope:
-- DESeq2, Rscript, DEG analysis, QC plots, PCA, heatmap, volcano plot,
+- DESeq2, Rscript, DEG analysis, normalization, PCA, sample correlation,
+- heatmap, volcano plot,
   GSEA, ORA, pathway enrichment, cloud storage, login, Duke DCC, SLURM.
 """
 
@@ -38,12 +39,41 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_5"
+APP_VERSION = "bulk_rnaseq_explorer_v1_6"
+
+DEFAULT_QC_COLORS = [
+    "#355070", "#6d597a", "#b56576", "#e56b6f",
+    "#4d908e", "#577590", "#bc6c25", "#8d99ae",
+    "#2a9d8f", "#7f5539", "#4361ee", "#588157",
+]
+
+QC_PLOT_DEFINITIONS = {
+    "library_size": {
+        "title": "Library Size",
+        "metric_col": "Library size",
+        "description": "Total raw counts per sample or QC group.",
+        "y_axis_title": "Total raw counts",
+        "y_tick_format": None,
+    },
+    "detected_genes": {
+        "title": "Detected Genes",
+        "metric_col": "Detected genes",
+        "description": "Genes with non-zero raw counts per sample or QC group.",
+        "y_axis_title": "Detected genes",
+        "y_tick_format": None,
+    },
+    "zero_fraction": {
+        "title": "Zero-count Fraction",
+        "metric_col": "Zero fraction",
+        "description": "Fraction of genes with zero raw counts.",
+        "y_axis_title": "Zero-count fraction",
+        "y_tick_format": ".0%",
+    },
+}
 
 TEMPLATE_TEXT = """EnsemblID / Gene_symbol\tSample_1\tSample_2\tSample_3\tSample_4
 ENSMUSG00000000001\t120\t98\t115\t130
@@ -72,6 +102,8 @@ def init_session_state() -> None:
                 "Group 2": [],
             },
         },
+        "qc_plot_settings": default_qc_plot_settings(),
+        "qc_export_bytes": {},
         "gene_map_df": None,
         "gene_map_status": {
             "detected": False,
@@ -91,6 +123,11 @@ def init_session_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    st.session_state["app_version"] = APP_VERSION
+    plot_settings = st.session_state.setdefault("qc_plot_settings", default_qc_plot_settings())
+    for plot_id in QC_PLOT_DEFINITIONS:
+        plot_settings.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+    st.session_state.setdefault("qc_export_bytes", {})
 
 
 def default_conversion_summary() -> dict[str, Any]:
@@ -120,6 +157,8 @@ def clear_count_matrix_state() -> None:
         "grouping_set_name": "QC grouping 1",
         "groups": {"Group 1": [], "Group 2": []},
     }
+    st.session_state["qc_plot_settings"] = default_qc_plot_settings()
+    st.session_state["qc_export_bytes"] = {}
     st.session_state["gene_id_mode"] = "unknown"
     st.session_state["conversion_summary"] = default_conversion_summary()
     st.session_state["duplicate_summary_df"] = pd.DataFrame(columns=["Gene", "Original IDs", "Number of duplicated rows"])
@@ -132,6 +171,7 @@ def reset_analysis_state() -> None:
     st.session_state["deg_results"] = None
     st.session_state["pathway_results"] = None
     st.session_state["plots"] = None
+    st.session_state["qc_export_bytes"] = {}
 
 
 def read_count_matrix_file(uploaded_file) -> pd.DataFrame:
@@ -498,9 +538,10 @@ def aggregate_sample_qc_by_group(
     grouping_dict: dict[str, list[str]],
     metric_col: str,
     aggregation: str,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Aggregate one sample-level QC metric by QC group."""
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Aggregate one sample-level QC metric by QC group and return overlay sample dots."""
     rows = []
+    overlay_rows = []
     missing_samples = []
     sample_set = set(sample_qc_df["Sample"].astype(str))
     for group_name, samples in grouping_dict.items():
@@ -509,14 +550,196 @@ def aggregate_sample_qc_by_group(
         values = sample_qc_df.loc[sample_qc_df["Sample"].isin(valid_samples), metric_col]
         if values.empty:
             continue
+        method = aggregation if aggregation in {"Mean", "Median", "Sum"} else "Mean"
         if aggregation == "Median":
             value = float(values.median())
         elif aggregation == "Sum":
             value = float(values.sum())
         else:
             value = float(values.mean())
-        rows.append({"Group": group_name, "Value": value, "N samples": len(valid_samples)})
-    return pd.DataFrame(rows), sorted(set(missing_samples))
+        rows.append({"Label": group_name, "Value": value, "ColorKey": f"group:{group_name}", "N samples": len(valid_samples)})
+        for sample in valid_samples:
+            sample_value = sample_qc_df.loc[sample_qc_df["Sample"] == sample, metric_col].iloc[0]
+            overlay_rows.append(
+                {
+                    "Group": group_name,
+                    "Sample": sample,
+                    "Value": float(sample_value),
+                    "ColorKey": f"group:{group_name}",
+                    "Aggregation": method,
+                }
+            )
+    return pd.DataFrame(rows), pd.DataFrame(overlay_rows), sorted(set(missing_samples))
+
+
+def default_qc_plot_settings() -> dict[str, dict[str, Any]]:
+    """Return default settings for all QC bar plots."""
+    return {plot_id: get_default_qc_plot_setting(plot_id) for plot_id in QC_PLOT_DEFINITIONS}
+
+
+def get_default_qc_plot_setting(plot_id: str) -> dict[str, Any]:
+    """Return default settings for one QC bar plot."""
+    return {
+        "plot_by": "Sample name",
+        "grouping_set": None,
+        "aggregation": "Mean",
+        "width": 980,
+        "height": 480,
+        "x_axis_angle": 45,
+        "colors": {},
+    }
+
+
+def reset_qc_plot_setting(plot_id: str) -> None:
+    """Reset only one QC plot's settings and prepared exports."""
+    st.session_state["qc_plot_settings"][plot_id] = get_default_qc_plot_setting(plot_id)
+    for suffix in ["plot_by", "grouping_set", "grouping_set_disabled", "aggregation", "width", "height", "x_axis_angle"]:
+        st.session_state.pop(f"{plot_id}_{suffix}", None)
+    for key in list(st.session_state.get("qc_export_bytes", {})):
+        if key.startswith(f"{plot_id}:"):
+            st.session_state["qc_export_bytes"].pop(key, None)
+
+
+def default_qc_group_editor(sample_columns: list[str]) -> dict[str, Any]:
+    """Build a default QC grouping draft."""
+    midpoint = max(1, len(sample_columns) // 2)
+    return {
+        "grouping_set_name": "QC grouping 1",
+        "groups": {
+            "Group 1": sample_columns[:midpoint],
+            "Group 2": sample_columns[midpoint:],
+        },
+    }
+
+
+def normalize_qc_group_editor(editor: dict[str, Any] | None, sample_columns: list[str]) -> dict[str, Any]:
+    """Keep the grouping draft compatible with current samples."""
+    if not isinstance(editor, dict) or not isinstance(editor.get("groups"), dict):
+        return default_qc_group_editor(sample_columns)
+    sample_set = set(sample_columns)
+    normalized_groups: dict[str, list[str]] = {}
+    for index, (group_name, samples) in enumerate(editor.get("groups", {}).items(), start=1):
+        clean_name = str(group_name).strip() or f"Group {index}"
+        unique_samples = []
+        for sample in samples if isinstance(samples, list) else []:
+            sample_text = str(sample)
+            if sample_text in sample_set and sample_text not in unique_samples:
+                unique_samples.append(sample_text)
+        normalized_groups[clean_name] = unique_samples
+    while len(normalized_groups) < 2:
+        normalized_groups[f"Group {len(normalized_groups) + 1}"] = []
+    return {
+        "grouping_set_name": str(editor.get("grouping_set_name") or "QC grouping 1"),
+        "groups": normalized_groups,
+    }
+
+
+def get_unassigned_samples(groups: dict[str, list[str]], sample_columns: list[str]) -> list[str]:
+    """Return samples not assigned to any QC group."""
+    assigned = {sample for samples in groups.values() for sample in samples}
+    return [sample for sample in sample_columns if sample not in assigned]
+
+
+def get_duplicate_assigned_samples(groups: dict[str, list[str]]) -> list[str]:
+    """Return samples assigned to more than one QC group."""
+    counts: dict[str, int] = {}
+    for samples in groups.values():
+        for sample in samples:
+            counts[sample] = counts.get(sample, 0) + 1
+    return sorted(sample for sample, count in counts.items() if count > 1)
+
+
+def validate_qc_grouping(groups: dict[str, list[str]], sample_columns: list[str]) -> list[str]:
+    """Validate a QC grouping before saving."""
+    errors = []
+    if not groups:
+        errors.append("At least one group is required.")
+    duplicate_group_names = len(groups) != len({name.strip() for name in groups})
+    if duplicate_group_names:
+        errors.append("Group names must be unique.")
+    duplicates = get_duplicate_assigned_samples(groups)
+    if duplicates:
+        errors.append(f"Samples assigned to multiple groups: {', '.join(duplicates)}")
+    sample_set = set(sample_columns)
+    unknown = sorted({sample for samples in groups.values() for sample in samples if sample not in sample_set})
+    if unknown:
+        errors.append(f"Unknown samples: {', '.join(unknown)}")
+    return errors
+
+
+def save_qc_grouping_set(grouping_name: str, groups: dict[str, list[str]]) -> str:
+    """Persist a QC grouping set and make it active."""
+    clean_name = grouping_name.strip() or "QC grouping 1"
+    st.session_state["qc_grouping_sets"][clean_name] = {
+        group.strip(): list(samples) for group, samples in groups.items() if group.strip()
+    }
+    st.session_state["active_qc_grouping_set"] = clean_name
+    reset_analysis_state()
+    return clean_name
+
+
+def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
+    """Get a stable color for one sample or group in one plot."""
+    settings = st.session_state["qc_plot_settings"].setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+    colors = settings.setdefault("colors", {})
+    if entity_key not in colors:
+        colors[entity_key] = DEFAULT_QC_COLORS[index % len(DEFAULT_QC_COLORS)]
+    return colors[entity_key]
+
+
+def set_qc_color(plot_id: str, entity_key: str, color: str) -> None:
+    """Store a custom QC color."""
+    settings = st.session_state["qc_plot_settings"].setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+    settings.setdefault("colors", {})[entity_key] = color
+
+
+def render_qc_color_settings(plot_id: str, entity_keys: list[str], labels: list[str]) -> None:
+    """Render color pickers for the current QC plot basis."""
+    if not entity_keys:
+        st.caption("Color settings are available after plot entities are available.")
+        return
+    columns = st.columns(3)
+    for index, (entity_key, label) in enumerate(zip(entity_keys, labels)):
+        with columns[index % 3]:
+            color = st.color_picker(
+                label,
+                value=get_qc_color(plot_id, entity_key, index),
+                key=f"{plot_id}_color_{entity_key}",
+            )
+            set_qc_color(plot_id, entity_key, color)
+
+
+def prepare_qc_plot_data(
+    sample_qc_df: pd.DataFrame,
+    plot_id: str,
+    metric_col: str,
+    settings: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame | None, list[str]]:
+    """Prepare sample-level or group-level QC plot data."""
+    if settings.get("plot_by") != "QC assignment group":
+        plot_df = sample_qc_df[["Sample", metric_col]].rename(columns={"Sample": "Label", metric_col: "Value"})
+        plot_df["ColorKey"] = plot_df["Label"].map(lambda sample: f"sample:{sample}")
+        return plot_df, None, []
+
+    grouping_name = settings.get("grouping_set")
+    grouping_sets = st.session_state.get("qc_grouping_sets", {})
+    grouping_dict = grouping_sets.get(grouping_name)
+    if not grouping_dict:
+        return pd.DataFrame(), pd.DataFrame(), []
+    aggregation = settings.get("aggregation", "Mean")
+    if plot_id == "zero_fraction" and aggregation == "Sum":
+        aggregation = "Mean"
+        settings["aggregation"] = "Mean"
+    return aggregate_sample_qc_by_group(sample_qc_df, grouping_dict, metric_col, aggregation)
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert #RRGGBB to an rgba color string."""
+    color = hex_color.lstrip("#")
+    if len(color) != 6:
+        return f"rgba(53, 80, 112, {alpha})"
+    red, green, blue = (int(color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({red}, {green}, {blue}, {alpha})"
 
 
 def format_path_for_display(path: str | None, max_length: int = 60) -> str:
@@ -664,6 +887,8 @@ def render_upload_count_matrix_tab() -> None:
                 }
                 st.session_state["qc_grouping_sets"] = {}
                 st.session_state["active_qc_grouping_set"] = None
+                st.session_state["qc_plot_settings"] = default_qc_plot_settings()
+                st.session_state["qc_export_bytes"] = {}
                 _reprocess_uploaded_counts()
             except Exception as exc:
                 st.error(f"Could not read the uploaded count matrix: {exc}")
@@ -689,6 +914,8 @@ def render_upload_count_matrix_tab() -> None:
         }
         st.session_state["qc_grouping_sets"] = {}
         st.session_state["active_qc_grouping_set"] = None
+        st.session_state["qc_plot_settings"] = default_qc_plot_settings()
+        st.session_state["qc_export_bytes"] = {}
         _reprocess_uploaded_counts()
 
     sample_columns = st.session_state["sample_columns"]
@@ -706,106 +933,164 @@ def render_upload_count_matrix_tab() -> None:
 
 
 def make_qc_bar_plot(
-    data_df: pd.DataFrame,
+    plot_df: pd.DataFrame,
+    plot_id: str,
+    title: str,
     x_col: str,
     y_col: str,
-    title: str,
     y_axis_title: str,
-    group_col: str | None = None,
+    width: int,
+    height: int,
+    x_axis_angle: int,
+    colors: dict[str, str],
     y_tick_format: str | None = None,
+    overlay_df: pd.DataFrame | None = None,
 ) -> go.Figure:
     """Create a clean Plotly QC bar plot."""
-    marker_color = "#4C78A8" if group_col is None else "#59A14F"
-    fig = go.Figure(
-        data=[
-            go.Bar(
-                x=data_df[x_col],
-                y=data_df[y_col],
-                marker_color=marker_color,
-                customdata=data_df[[group_col]].to_numpy() if group_col and group_col in data_df else None,
-                hovertemplate=f"{x_col}: %{{x}}<br>{y_axis_title}: %{{y:,.4g}}<extra></extra>",
-            )
-        ]
+    bar_colors = [
+        colors.get(color_key, get_qc_color(plot_id, str(color_key), index))
+        for index, color_key in enumerate(plot_df["ColorKey"])
+    ]
+    customdata_cols = ["N samples"] if "N samples" in plot_df.columns else []
+    customdata = plot_df[customdata_cols].to_numpy() if customdata_cols else None
+    hovertemplate = (
+        "Group: %{x}<br>Value: %{y:,.4g}<br>N samples: %{customdata[0]}<extra></extra>"
+        if customdata_cols
+        else "Sample: %{x}<br>Value: %{y:,.4g}<extra></extra>"
     )
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=plot_df[x_col],
+            y=plot_df[y_col],
+            marker_color=bar_colors,
+            customdata=customdata,
+            hovertemplate=hovertemplate,
+            name=title,
+        )
+    )
+    if overlay_df is not None and not overlay_df.empty:
+        dot_colors = [
+            _hex_to_rgba(colors.get(color_key, get_qc_color(plot_id, str(color_key), index)), 0.82)
+            for index, color_key in enumerate(overlay_df["ColorKey"])
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=overlay_df["Group"],
+                y=overlay_df["Value"],
+                mode="markers",
+                marker=dict(size=7, color=dot_colors, line=dict(width=1, color="rgba(17, 24, 39, 0.55)")),
+                customdata=overlay_df[["Sample", "Group", "Aggregation"]].to_numpy(),
+                hovertemplate=(
+                    "Sample: %{customdata[0]}<br>"
+                    "Group: %{customdata[1]}<br>"
+                    "Value: %{y:,.4g}<br>"
+                    "Aggregation: %{customdata[2]}<extra></extra>"
+                ),
+                name="Samples",
+            )
+        )
     fig.update_layout(
         title=title,
-        height=520,
+        width=width,
+        height=height,
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=70, r=30, t=70, b=120),
-        xaxis=dict(tickangle=45, title="", showgrid=False),
+        margin=dict(l=70, r=30, t=70, b=110),
+        xaxis=dict(tickangle=x_axis_angle, title="", showgrid=False),
         yaxis=dict(title=y_axis_title, showgrid=True, gridcolor="#E5E7EB", tickformat=y_tick_format),
         bargap=0.25,
         font=dict(size=13),
+        showlegend=overlay_df is not None and not overlay_df.empty,
     )
     return fig
 
 
-def render_qc_grouping_section(sample_columns: list[str]) -> None:
-    """Render stable multiselect-based QC grouping editor.
+def render_qc_group_editor_form(sample_columns: list[str]) -> None:
+    """Render a form-based QC grouping draft editor."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    st.session_state["current_qc_group_editor"] = editor
+    group_items = list(editor["groups"].items())
 
-    Drag-and-drop grouping can be added later via a custom Streamlit component;
-    v1.5 uses multiselect-based grouping for stability and maintainability.
-    """
-    st.markdown("### Assign QC grouping")
-    editor = st.session_state["current_qc_group_editor"]
-    grouping_name = st.text_input("Grouping set name", value=editor["grouping_set_name"], key="qc_grouping_name_input")
-    editor["grouping_set_name"] = grouping_name
-
-    group_names = list(editor["groups"].keys())
-    if st.button("Add group"):
-        next_index = len(group_names) + 1
-        editor["groups"][f"Group {next_index}"] = []
-        st.rerun()
-
-    updated_groups: dict[str, list[str]] = {}
-    for index, old_group_name in enumerate(group_names):
-        current_samples = editor["groups"].get(old_group_name, [])
-        assigned_elsewhere = {
-            sample
-            for other_group, samples in editor["groups"].items()
-            if other_group != old_group_name
-            for sample in samples
-        }
-        options = [sample for sample in sample_columns if sample not in assigned_elsewhere or sample in current_samples]
-        cols = st.columns([2, 5, 1])
-        with cols[0]:
-            new_group_name = st.text_input("Group name", value=old_group_name, key=f"qc_group_name_{index}")
-        with cols[1]:
-            selected_samples = st.multiselect(
-                "Samples",
-                options=options,
-                default=[sample for sample in current_samples if sample in options],
-                key=f"qc_group_samples_{index}",
-            )
-        with cols[2]:
-            remove = st.button("Remove", key=f"qc_group_remove_{index}", disabled=len(group_names) <= 2)
-        if remove and len(group_names) > 2:
-            editor["groups"].pop(old_group_name, None)
-            st.session_state["current_qc_group_editor"] = editor
-            st.rerun()
-        if not remove:
+    with st.form("qc_group_editor_form"):
+        grouping_name = st.text_input("Grouping set name", value=editor["grouping_set_name"])
+        updated_groups: dict[str, list[str]] = {}
+        entered_group_names: list[str] = []
+        remove_index: int | None = None
+        for index, (old_group_name, current_samples) in enumerate(group_items):
+            assigned_elsewhere = {
+                sample
+                for other_index, (_, samples) in enumerate(group_items)
+                if other_index != index
+                for sample in samples
+            }
+            options = [sample for sample in sample_columns if sample not in assigned_elsewhere or sample in current_samples]
+            cols = st.columns([2, 5, 1])
+            with cols[0]:
+                new_group_name = st.text_input("Group name", value=old_group_name, key=f"qc_group_name_form_{index}")
+            with cols[1]:
+                selected_samples = st.multiselect(
+                    "Samples",
+                    options=options,
+                    default=[sample for sample in current_samples if sample in options],
+                    key=f"qc_group_samples_form_{index}",
+                )
+            with cols[2]:
+                if st.form_submit_button("Remove group", key=f"qc_group_remove_form_{index}", disabled=len(group_items) <= 2):
+                    remove_index = index
             clean_name = new_group_name.strip() or old_group_name
+            entered_group_names.append(clean_name)
             updated_groups[clean_name] = selected_samples
 
-    if len(updated_groups) < 2:
-        updated_groups = editor["groups"]
-        st.warning("At least two groups are required.")
-    editor["groups"] = updated_groups
-    st.session_state["current_qc_group_editor"] = editor
+        action_cols = st.columns([1, 1, 2])
+        with action_cols[0]:
+            apply_draft = st.form_submit_button("Apply grouping draft")
+        with action_cols[1]:
+            add_group = st.form_submit_button("Add group")
+        with action_cols[2]:
+            save_grouping = st.form_submit_button("Save QC grouping", type="primary")
 
-    assigned_samples = {sample for samples in editor["groups"].values() for sample in samples}
-    unassigned_samples = [sample for sample in sample_columns if sample not in assigned_samples]
+    if apply_draft or add_group or save_grouping or remove_index is not None:
+        duplicate_names = sorted({name for name in entered_group_names if entered_group_names.count(name) > 1})
+        if save_grouping and duplicate_names:
+            st.error(f"Group names must be unique: {', '.join(duplicate_names)}")
+            return
+        if remove_index is not None and len(updated_groups) > 2:
+            name_to_remove = list(updated_groups.keys())[remove_index]
+            updated_groups = {name: samples for name, samples in updated_groups.items() if name != name_to_remove}
+        if add_group:
+            next_index = len(updated_groups) + 1
+            while f"Group {next_index}" in updated_groups:
+                next_index += 1
+            updated_groups[f"Group {next_index}"] = []
+        draft = normalize_qc_group_editor({"grouping_set_name": grouping_name, "groups": updated_groups}, sample_columns)
+        st.session_state["current_qc_group_editor"] = draft
+        if save_grouping:
+            errors = validate_qc_grouping(draft["groups"], sample_columns)
+            if errors:
+                for error in errors:
+                    st.error(error)
+                return
+            else:
+                saved_name = save_qc_grouping_set(draft["grouping_set_name"], draft["groups"])
+                st.success(f"Saved QC grouping: {saved_name}")
+        elif apply_draft:
+            st.success("Grouping draft applied.")
+        if add_group or remove_index is not None:
+            st.rerun()
+
+    draft_groups = st.session_state["current_qc_group_editor"]["groups"]
     st.write("Unassigned samples:")
-    render_inline_badges(unassigned_samples)
+    render_inline_badges(get_unassigned_samples(draft_groups, sample_columns))
+    duplicates = get_duplicate_assigned_samples(draft_groups)
+    if duplicates:
+        st.warning(f"Duplicate assignment in current draft: {', '.join(duplicates)}")
 
-    if st.button("Save QC grouping"):
-        clean_name = editor["grouping_set_name"].strip() or "QC grouping 1"
-        st.session_state["qc_grouping_sets"][clean_name] = {
-            group: samples for group, samples in editor["groups"].items() if group.strip()
-        }
-        st.session_state["active_qc_grouping_set"] = clean_name
-        st.success(f"Saved QC grouping: {clean_name}")
+
+def render_qc_grouping_section(sample_columns: list[str]) -> None:
+    """Render the form-based QC grouping editor and saved-set controls."""
+    st.markdown("### Assign QC grouping")
+    render_qc_group_editor_form(sample_columns)
 
     grouping_names = list(st.session_state["qc_grouping_sets"].keys())
     if grouping_names:
@@ -821,65 +1106,155 @@ def render_qc_grouping_section(sample_columns: list[str]) -> None:
 
 
 def render_qc_barplot_section(
-    title: str,
-    description: str,
+    plot_id: str,
     sample_qc_df: pd.DataFrame,
-    metric_col: str,
-    y_axis_title: str,
-    default_aggregation: str,
-    y_tick_format: str | None = None,
 ) -> None:
     """Render controls and Plotly bar plot for one QC metric."""
+    definition = QC_PLOT_DEFINITIONS[plot_id]
+    title = definition["title"]
+    description = definition["description"]
+    metric_col = definition["metric_col"]
+    y_axis_title = definition["y_axis_title"]
+    y_tick_format = definition["y_tick_format"]
+    settings_store = st.session_state.setdefault("qc_plot_settings", default_qc_plot_settings())
+    settings = settings_store.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+
     st.markdown(f"### {title}")
     st.write(description)
 
     grouping_sets = st.session_state["qc_grouping_sets"]
-    active_grouping = st.session_state["active_qc_grouping_set"]
-    can_group = bool(active_grouping and active_grouping in grouping_sets)
+    grouping_names = list(grouping_sets.keys())
+    if settings.get("grouping_set") not in grouping_sets:
+        settings["grouping_set"] = st.session_state.get("active_qc_grouping_set") if st.session_state.get("active_qc_grouping_set") in grouping_sets else None
+    if settings.get("plot_by") not in {"Sample name", "QC assignment group"}:
+        settings["plot_by"] = "Sample name"
+    if plot_id == "zero_fraction" and settings.get("aggregation") == "Sum":
+        settings["aggregation"] = "Mean"
+        st.session_state.pop(f"{plot_id}_aggregation", None)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        plot_by_options = ["Sample name"] + (["QC group"] if can_group else [])
-        plot_by = st.selectbox("Plot by", plot_by_options, key=f"{metric_col}_plot_by")
-    with col2:
-        if can_group:
-            grouping_name = st.selectbox(
-                "QC grouping set",
-                list(grouping_sets.keys()),
-                index=list(grouping_sets.keys()).index(active_grouping),
-                key=f"{metric_col}_grouping_set",
+    control_cols = st.columns([1.1, 1.5, 1.0, 1.3])
+    with control_cols[0]:
+        settings["plot_by"] = st.selectbox(
+            "Plot by",
+            ["Sample name", "QC assignment group"],
+            index=["Sample name", "QC assignment group"].index(settings.get("plot_by", "Sample name")),
+            key=f"{plot_id}_plot_by",
+        )
+    plot_by_group = settings["plot_by"] == "QC assignment group"
+    with control_cols[1]:
+        if plot_by_group and grouping_names:
+            selected_grouping = settings.get("grouping_set") if settings.get("grouping_set") in grouping_names else grouping_names[0]
+            settings["grouping_set"] = st.selectbox(
+                "QC assignment set",
+                grouping_names,
+                index=grouping_names.index(selected_grouping),
+                key=f"{plot_id}_grouping_set",
             )
-            st.session_state["active_qc_grouping_set"] = grouping_name
         else:
-            st.selectbox("QC grouping set", ["No QC grouping selected"], disabled=True, key=f"{metric_col}_grouping_set_disabled")
-            grouping_name = None
-    with col3:
-        aggregations = ["Mean", "Median", "Sum"]
-        aggregation = st.selectbox(
+            st.selectbox(
+                "QC assignment set",
+                ["No QC assignment selected"],
+                disabled=True,
+                key=f"{plot_id}_grouping_set_disabled",
+            )
+            if not plot_by_group:
+                settings["grouping_set"] = None
+    with control_cols[2]:
+        aggregation_options = ["Mean", "Median"] if plot_id == "zero_fraction" else ["Mean", "Median", "Sum"]
+        settings["aggregation"] = st.selectbox(
             "Aggregation",
-            aggregations,
-            index=aggregations.index(default_aggregation),
-            key=f"{metric_col}_aggregation",
+            aggregation_options,
+            index=aggregation_options.index(settings.get("aggregation", "Mean")),
+            disabled=not plot_by_group,
+            key=f"{plot_id}_aggregation",
         )
+    with control_cols[3]:
+        if st.button("Reset", key=f"{plot_id}_reset"):
+            reset_qc_plot_setting(plot_id)
+            st.rerun()
 
-    if plot_by == "QC group" and grouping_name:
-        plot_df, missing_samples = aggregate_sample_qc_by_group(
-            sample_qc_df,
-            grouping_sets[grouping_name],
-            metric_col,
-            aggregation,
-        )
-        if missing_samples:
-            st.warning(f"Ignored samples not found in QC table: {', '.join(missing_samples[:8])}")
-        if plot_df.empty:
-            st.warning("No valid samples are assigned in the selected QC grouping set.")
+    with st.expander("Advanced settings"):
+        adv_cols = st.columns(3)
+        with adv_cols[0]:
+            settings["width"] = st.slider("Plot width", 640, 1440, int(settings.get("width", 980)), 20, key=f"{plot_id}_width")
+        with adv_cols[1]:
+            settings["height"] = st.slider("Plot height", 360, 900, int(settings.get("height", 480)), 20, key=f"{plot_id}_height")
+        with adv_cols[2]:
+            angle_options = [0, 30, 45, 60, 90]
+            settings["x_axis_angle"] = st.selectbox(
+                "X-axis angle",
+                angle_options,
+                index=angle_options.index(int(settings.get("x_axis_angle", 45))),
+                key=f"{plot_id}_x_axis_angle",
+            )
+
+    if plot_by_group and not grouping_names:
+        st.warning("Please create and save a QC grouping set first.")
+        settings["plot_by"] = "Sample name"
+
+    plot_df, overlay_df, missing_samples = prepare_qc_plot_data(sample_qc_df, plot_id, metric_col, settings)
+    if missing_samples:
+        st.warning(f"Ignored samples not found in QC table: {', '.join(missing_samples[:8])}")
+    if plot_df.empty:
+        st.warning("No valid samples are assigned in the selected QC grouping set.")
+        return
+
+    entity_keys = list(plot_df["ColorKey"])
+    entity_labels = list(plot_df["Label"])
+    with st.expander("Color settings"):
+        render_qc_color_settings(plot_id, entity_keys, entity_labels)
+
+    color_map = {
+        entity_key: get_qc_color(plot_id, entity_key, index)
+        for index, entity_key in enumerate(entity_keys)
+    }
+    fig = make_qc_bar_plot(
+        plot_df,
+        plot_id,
+        title,
+        "Label",
+        "Value",
+        y_axis_title,
+        int(settings["width"]),
+        int(settings["height"]),
+        int(settings["x_axis_angle"]),
+        color_map,
+        y_tick_format=y_tick_format,
+        overlay_df=overlay_df,
+    )
+
+    st.plotly_chart(fig, use_container_width=False)
+    export_cols = st.columns([1, 1, 4])
+    with export_cols[0]:
+        export_plotly_figure(fig, f"{plot_id}_{APP_VERSION}", "png")
+    with export_cols[1]:
+        export_plotly_figure(fig, f"{plot_id}_{APP_VERSION}", "svg")
+
+
+def export_plotly_figure(fig: go.Figure, filename_base: str, format: str) -> None:
+    """Prepare and download a static Plotly figure export using kaleido."""
+    export_key = f"{filename_base}:{format}"
+    mime = "image/png" if format == "png" else "image/svg+xml"
+    label = f"Prepare {format.upper()}"
+    if st.button(label, key=f"prepare_{export_key}"):
+        try:
+            scale = 3 if format == "png" else None
+            kwargs = {"format": format}
+            if scale is not None:
+                kwargs["scale"] = scale
+            st.session_state.setdefault("qc_export_bytes", {})[export_key] = fig.to_image(**kwargs)
+        except Exception:
+            st.warning("Static image export requires kaleido. Install with: pip install kaleido")
             return
-        fig = make_qc_bar_plot(plot_df, "Group", "Value", title, y_axis_title, group_col="Group", y_tick_format=y_tick_format)
-    else:
-        plot_df = sample_qc_df[["Sample", metric_col]].rename(columns={metric_col: "Value"})
-        fig = make_qc_bar_plot(plot_df, "Sample", "Value", title, y_axis_title, y_tick_format=y_tick_format)
-
-    st.plotly_chart(fig, use_container_width=True)
+    export_bytes = st.session_state.setdefault("qc_export_bytes", {}).get(export_key)
+    if export_bytes:
+        st.download_button(
+            f"Download {format.upper()}",
+            data=export_bytes,
+            file_name=f"{filename_base}.{format}",
+            mime=mime,
+            key=f"download_{export_key}",
+        )
 
 
 def render_quality_control_tab() -> None:
@@ -907,31 +1282,9 @@ def render_quality_control_tab() -> None:
     st.dataframe(display_sample_qc, use_container_width=True, hide_index=True)
 
     render_qc_grouping_section(sample_columns)
-    render_qc_barplot_section(
-        "Library Size",
-        "Total raw counts per sample or QC group.",
-        sample_qc_df,
-        "Library size",
-        "Total raw counts",
-        "Mean",
-    )
-    render_qc_barplot_section(
-        "Detected Genes",
-        "Genes with non-zero raw counts per sample or QC group.",
-        sample_qc_df,
-        "Detected genes",
-        "Detected genes",
-        "Mean",
-    )
-    render_qc_barplot_section(
-        "Zero-count Fraction",
-        "Fraction of genes with zero raw counts.",
-        sample_qc_df,
-        "Zero fraction",
-        "Zero-count fraction",
-        "Mean",
-        y_tick_format=".0%",
-    )
+    render_qc_barplot_section("library_size", sample_qc_df)
+    render_qc_barplot_section("detected_genes", sample_qc_df)
+    render_qc_barplot_section("zero_fraction", sample_qc_df)
 
 
 def main() -> None:
