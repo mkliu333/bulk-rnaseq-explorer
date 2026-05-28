@@ -1,15 +1,15 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_8
+Version: bulk_rnaseq_explorer_v1_9
 
-Scope for v1.8:
+Scope for v1.9:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
 - Merge duplicated processed gene symbols by summing raw counts.
 - Produce a clean processed count matrix for future QC.
-- Optimize Quality Control dataset summary and QC grouping editor.
-- Use immediate session-state updates for stable sample assignment filtering.
+- Fix Quality Control barplot reset, color settings, advanced controls, and exports.
+- Keep QC barplot state deterministic across Streamlit reruns.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -43,7 +43,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_8"
+APP_VERSION = "bulk_rnaseq_explorer_v1_9"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -130,7 +130,9 @@ def init_session_state() -> None:
     st.session_state["app_version"] = APP_VERSION
     plot_settings = st.session_state.setdefault("qc_plot_settings", default_qc_plot_settings())
     for plot_id in QC_PLOT_DEFINITIONS:
-        plot_settings.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+        setting = plot_settings.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
+        for setting_key, setting_value in get_default_qc_plot_setting(plot_id).items():
+            setting.setdefault(setting_key, setting_value)
     st.session_state.setdefault("qc_export_bytes", {})
     st.session_state.setdefault("qc_summary", None)
     st.session_state.setdefault("qc_summary_signature", None)
@@ -638,33 +640,54 @@ def get_default_qc_plot_setting(plot_id: str) -> dict[str, Any]:
         "width": 980,
         "height": 480,
         "x_axis_angle": 45,
+        "axis_title_font_size": 14,
         "colors": {},
     }
 
 
 def reset_qc_plot_setting(plot_id: str) -> None:
-    """Reset only one QC plot's settings and prepared exports."""
+    """Reset one QC plot, including Streamlit widget state that can repopulate old values."""
     st.session_state["qc_plot_settings"][plot_id] = get_default_qc_plot_setting(plot_id)
-    for suffix in ["plot_by", "grouping_set", "grouping_set_disabled", "aggregation", "width", "height", "x_axis_angle"]:
+    widget_suffixes = [
+        "plot_by",
+        "grouping_set",
+        "grouping_set_disabled",
+        "aggregation",
+        "width",
+        "height",
+        "x_axis_angle",
+        "axis_title_font_size",
+    ]
+    for suffix in widget_suffixes:
         st.session_state.pop(f"{plot_id}_{suffix}", None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(f"{plot_id}_color_"):
+            st.session_state.pop(key, None)
+    clear_qc_export_cache(plot_id)
+    clear_qc_plot_cache(plot_id)
+    st.rerun()
+
+
+def clear_qc_export_cache(plot_id: str | None = None) -> None:
+    """Clear cached static Plotly export bytes."""
+    if plot_id is None:
+        st.session_state["qc_export_bytes"] = {}
+        return
     for key in list(st.session_state.get("qc_export_bytes", {})):
-        if key.startswith(f"{plot_id}:"):
+        if plot_id in str(key):
             st.session_state["qc_export_bytes"].pop(key, None)
 
 
 def clear_qc_plot_cache(plot_id: str | None = None) -> None:
-    """Clear cached QC plot data and prepared image exports."""
+    """Clear cached QC plot data."""
     if plot_id is None:
         st.session_state["qc_plot_data_cache"] = {}
-        st.session_state["qc_export_bytes"] = {}
+        clear_qc_export_cache()
         return
     cache = st.session_state.setdefault("qc_plot_data_cache", {})
     for key in list(cache):
         if key.startswith(f"{plot_id}:"):
             cache.pop(key, None)
-    for key in list(st.session_state.get("qc_export_bytes", {})):
-        if key.startswith(f"{plot_id}_") or key.startswith(f"{plot_id}:"):
-            st.session_state["qc_export_bytes"].pop(key, None)
 
 
 def default_qc_group_editor(sample_columns: list[str]) -> dict[str, Any]:
@@ -930,9 +953,20 @@ def render_qc_color_settings(plot_id: str, entity_keys: list[str], labels: list[
     if not entity_keys:
         st.caption("Color settings are available after plot entities are available.")
         return
-    columns = st.columns(3)
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stColorPicker"] {
+            margin-bottom: 0.25rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    n_cols = min(8, max(1, len(entity_keys)))
+    columns = st.columns(n_cols)
     for index, (entity_key, label) in enumerate(zip(entity_keys, labels)):
-        with columns[index % 3]:
+        with columns[index % n_cols]:
             color = st.color_picker(
                 label,
                 value=get_qc_color(plot_id, entity_key, index),
@@ -1244,6 +1278,7 @@ def make_qc_bar_plot(
     height: int,
     x_axis_angle: int,
     colors: dict[str, str],
+    axis_title_font_size: int = 14,
     y_tick_format: str | None = None,
     overlay_df: pd.DataFrame | None = None,
 ) -> go.Figure:
@@ -1298,8 +1333,14 @@ def make_qc_bar_plot(
         plot_bgcolor="white",
         paper_bgcolor="white",
         margin=dict(l=70, r=30, t=70, b=110),
-        xaxis=dict(tickangle=x_axis_angle, title="", showgrid=False),
-        yaxis=dict(title=y_axis_title, showgrid=True, gridcolor="#E5E7EB", tickformat=y_tick_format),
+        xaxis=dict(tickangle=x_axis_angle, title="", showgrid=False, title_font=dict(size=axis_title_font_size)),
+        yaxis=dict(
+            title=y_axis_title,
+            showgrid=True,
+            gridcolor="#E5E7EB",
+            tickformat=y_tick_format,
+            title_font=dict(size=axis_title_font_size),
+        ),
         bargap=0.25,
         font=dict(size=13),
         showlegend=False,
@@ -1455,11 +1496,12 @@ def render_qc_barplot_section(
         settings["grouping_set"] = st.session_state.get("active_qc_grouping_set") if st.session_state.get("active_qc_grouping_set") in grouping_sets else None
     if settings.get("plot_by") not in {"Sample name", "QC assignment group"}:
         settings["plot_by"] = "Sample name"
+    settings.setdefault("axis_title_font_size", 14)
     if plot_id == "zero_fraction" and settings.get("aggregation") == "Sum":
         settings["aggregation"] = "Mean"
         st.session_state.pop(f"{plot_id}_aggregation", None)
 
-    control_cols = st.columns([1.1, 1.5, 1.0, 0.6])
+    control_cols = st.columns([1.1, 1.45, 0.95, 0.55, 0.75, 0.75])
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1500,10 +1542,9 @@ def render_qc_barplot_section(
         st.write("")
         if st.button("Reset", key=f"{plot_id}_reset"):
             reset_qc_plot_setting(plot_id)
-            st.rerun()
 
     with st.expander("Advanced settings"):
-        adv_cols = st.columns(3)
+        adv_cols = st.columns(4)
         with adv_cols[0]:
             settings["width"] = st.slider("Plot width", 640, 1440, int(settings.get("width", 980)), 20, key=f"{plot_id}_width")
         with adv_cols[1]:
@@ -1515,6 +1556,15 @@ def render_qc_barplot_section(
                 angle_options,
                 index=angle_options.index(int(settings.get("x_axis_angle", 45))),
                 key=f"{plot_id}_x_axis_angle",
+            )
+        with adv_cols[3]:
+            settings["axis_title_font_size"] = st.slider(
+                "Axis title font size",
+                10,
+                28,
+                int(settings.get("axis_title_font_size", 14)),
+                1,
+                key=f"{plot_id}_axis_title_font_size",
             )
 
     if plot_by_group and not grouping_names:
@@ -1551,11 +1601,11 @@ def render_qc_barplot_section(
         int(settings["height"]),
         int(settings["x_axis_angle"]),
         color_map,
+        axis_title_font_size=int(settings.get("axis_title_font_size", 14)),
         y_tick_format=y_tick_format,
         overlay_df=overlay_df,
     )
 
-    st.plotly_chart(fig, use_container_width=False, key=f"{plot_id}_plotly_chart")
     export_signature = hashlib.sha256(
         json.dumps(
             {
@@ -1565,6 +1615,7 @@ def render_qc_barplot_section(
                 "width": settings.get("width"),
                 "height": settings.get("height"),
                 "x_axis_angle": settings.get("x_axis_angle"),
+                "axis_title_font_size": settings.get("axis_title_font_size"),
                 "colors": settings.get("colors", {}),
                 "qc_summary_signature": st.session_state.get("qc_summary_signature"),
             },
@@ -1572,37 +1623,63 @@ def render_qc_barplot_section(
         ).encode("utf-8")
     ).hexdigest()[:8]
     filename_base = f"{plot_id}_{APP_VERSION}_{export_signature}"
-    export_cols = st.columns([1, 1, 4])
-    with export_cols[0]:
-        export_plotly_figure(fig, filename_base, "png")
-    with export_cols[1]:
-        export_plotly_figure(fig, filename_base, "svg")
+    render_qc_export_buttons(fig, plot_id, filename_base, control_cols[4], control_cols[5])
+    st.plotly_chart(fig, use_container_width=False, key=f"{plot_id}_plotly_chart")
 
 
-def export_plotly_figure(fig: go.Figure, filename_base: str, format: str) -> None:
-    """Prepare and download a static Plotly figure export using kaleido."""
-    export_key = f"{filename_base}:{format}"
-    mime = "image/png" if format == "png" else "image/svg+xml"
-    label = f"Prepare {format.upper()}"
-    if st.button(label, key=f"prepare_{export_key}"):
-        try:
-            scale = 3 if format == "png" else None
-            kwargs = {"format": format}
-            if scale is not None:
-                kwargs["scale"] = scale
-            st.session_state.setdefault("qc_export_bytes", {})[export_key] = fig.to_image(**kwargs)
-        except Exception:
-            st.warning("Static image export requires kaleido. Install with: pip install kaleido")
-            return
-    export_bytes = st.session_state.setdefault("qc_export_bytes", {}).get(export_key)
-    if export_bytes:
+def get_plotly_export_bytes(fig: go.Figure, format: str, cache_key: str) -> bytes | None:
+    """Return cached Plotly static image bytes, generating them only for the current visual state."""
+    export_cache = st.session_state.setdefault("qc_export_bytes", {})
+    if cache_key in export_cache:
+        return export_cache[cache_key]
+    try:
+        kwargs: dict[str, Any] = {"format": format}
+        if format == "png":
+            kwargs["scale"] = 3
+        export_bytes = fig.to_image(**kwargs)
+        if isinstance(export_bytes, str):
+            export_bytes = export_bytes.encode("utf-8")
+        export_cache[cache_key] = export_bytes
+        return export_bytes
+    except Exception:
+        export_cache[cache_key] = None
+        return None
+
+
+def render_qc_export_buttons(
+    fig: go.Figure,
+    plot_id: str,
+    filename_base: str,
+    png_column,
+    svg_column,
+) -> None:
+    """Render direct PNG/SVG download buttons for one QC plot."""
+    png_key = f"{plot_id}:{filename_base}:png"
+    svg_key = f"{plot_id}:{filename_base}:svg"
+    png_bytes = get_plotly_export_bytes(fig, "png", png_key)
+    svg_bytes = get_plotly_export_bytes(fig, "svg", svg_key)
+    with png_column:
+        st.write("")
         st.download_button(
-            f"Download {format.upper()}",
-            data=export_bytes,
-            file_name=f"{filename_base}.{format}",
-            mime=mime,
-            key=f"download_{export_key}",
+            "Download PNG",
+            data=png_bytes or b"",
+            file_name=f"{filename_base}.png",
+            mime="image/png",
+            disabled=png_bytes is None,
+            key=f"{plot_id}_download_png",
         )
+    with svg_column:
+        st.write("")
+        st.download_button(
+            "Download SVG",
+            data=svg_bytes or b"",
+            file_name=f"{filename_base}.svg",
+            mime="image/svg+xml",
+            disabled=svg_bytes is None,
+            key=f"{plot_id}_download_svg",
+        )
+    if png_bytes is None or svg_bytes is None:
+        st.warning("Static image export requires kaleido. Install with: pip install kaleido")
 
 
 def render_quality_control_tab() -> None:
@@ -1651,7 +1728,8 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        div[data-testid="stButton"] button {
+        div[data-testid="stButton"] button,
+        div[data-testid="stDownloadButton"] button {
             white-space: nowrap;
         }
         </style>
