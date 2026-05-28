@@ -1,15 +1,15 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_6
+Version: bulk_rnaseq_explorer_v1_7
 
-Scope for v1.6:
+Scope for v1.7:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
 - Merge duplicated processed gene symbols by summing raw counts.
 - Produce a clean processed count matrix for future QC.
-- Add Quality Control dataset summary and configurable Plotly bar plots.
-- Add form-based QC grouping editor and old-HTML-style QC plot controls.
+- Optimize QC grouping and configurable Plotly bar plots.
+- Cache QC summary and plot data to reduce Streamlit rerun cost.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -43,7 +43,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_6"
+APP_VERSION = "bulk_rnaseq_explorer_v1_7"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -104,6 +104,9 @@ def init_session_state() -> None:
         },
         "qc_plot_settings": default_qc_plot_settings(),
         "qc_export_bytes": {},
+        "qc_summary": None,
+        "qc_summary_signature": None,
+        "qc_plot_data_cache": {},
         "gene_map_df": None,
         "gene_map_status": {
             "detected": False,
@@ -128,6 +131,9 @@ def init_session_state() -> None:
     for plot_id in QC_PLOT_DEFINITIONS:
         plot_settings.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
     st.session_state.setdefault("qc_export_bytes", {})
+    st.session_state.setdefault("qc_summary", None)
+    st.session_state.setdefault("qc_summary_signature", None)
+    st.session_state.setdefault("qc_plot_data_cache", {})
 
 
 def default_conversion_summary() -> dict[str, Any]:
@@ -159,6 +165,9 @@ def clear_count_matrix_state() -> None:
     }
     st.session_state["qc_plot_settings"] = default_qc_plot_settings()
     st.session_state["qc_export_bytes"] = {}
+    st.session_state["qc_summary"] = None
+    st.session_state["qc_summary_signature"] = None
+    st.session_state["qc_plot_data_cache"] = {}
     st.session_state["gene_id_mode"] = "unknown"
     st.session_state["conversion_summary"] = default_conversion_summary()
     st.session_state["duplicate_summary_df"] = pd.DataFrame(columns=["Gene", "Original IDs", "Number of duplicated rows"])
@@ -171,7 +180,6 @@ def reset_analysis_state() -> None:
     st.session_state["deg_results"] = None
     st.session_state["pathway_results"] = None
     st.session_state["plots"] = None
-    st.session_state["qc_export_bytes"] = {}
 
 
 def read_count_matrix_file(uploaded_file) -> pd.DataFrame:
@@ -533,6 +541,44 @@ def compute_qc_summary(processed_counts_df: pd.DataFrame, sample_columns: list[s
     return {"sample_qc_df": sample_qc_df, "gene_qc_summary": gene_qc_summary}
 
 
+def _qc_summary_signature() -> str:
+    """Return a stable signature for the current processed count matrix and samples."""
+    sample_columns = st.session_state.get("sample_columns", [])
+    return json.dumps(
+        {
+            "counts": st.session_state.get("counts_file_signature"),
+            "gene_id_column": st.session_state.get("gene_id_column"),
+            "samples": sample_columns,
+            "processed_shape": getattr(st.session_state.get("processed_counts_df"), "shape", None),
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def compute_and_store_qc_summary() -> dict[str, Any] | None:
+    """Compute QC summary once per processed matrix and store it in session state."""
+    processed_counts_df = st.session_state.get("processed_counts_df")
+    sample_columns = st.session_state.get("sample_columns", [])
+    if processed_counts_df is None or not sample_columns:
+        st.session_state["qc_summary"] = None
+        st.session_state["qc_summary_signature"] = None
+        return None
+    signature = _qc_summary_signature()
+    qc_summary = compute_qc_summary(processed_counts_df, sample_columns)
+    st.session_state["qc_summary"] = qc_summary
+    st.session_state["qc_summary_signature"] = signature
+    return qc_summary
+
+
+def get_cached_qc_summary() -> dict[str, Any] | None:
+    """Return cached QC summary, recomputing only when the processed matrix changed."""
+    signature = _qc_summary_signature()
+    if st.session_state.get("qc_summary") is None or st.session_state.get("qc_summary_signature") != signature:
+        return compute_and_store_qc_summary()
+    return st.session_state["qc_summary"]
+
+
 def aggregate_sample_qc_by_group(
     sample_qc_df: pd.DataFrame,
     grouping_dict: dict[str, list[str]],
@@ -600,6 +646,21 @@ def reset_qc_plot_setting(plot_id: str) -> None:
             st.session_state["qc_export_bytes"].pop(key, None)
 
 
+def clear_qc_plot_cache(plot_id: str | None = None) -> None:
+    """Clear cached QC plot data and prepared image exports."""
+    if plot_id is None:
+        st.session_state["qc_plot_data_cache"] = {}
+        st.session_state["qc_export_bytes"] = {}
+        return
+    cache = st.session_state.setdefault("qc_plot_data_cache", {})
+    for key in list(cache):
+        if key.startswith(f"{plot_id}:"):
+            cache.pop(key, None)
+    for key in list(st.session_state.get("qc_export_bytes", {})):
+        if key.startswith(f"{plot_id}_") or key.startswith(f"{plot_id}:"):
+            st.session_state["qc_export_bytes"].pop(key, None)
+
+
 def default_qc_group_editor(sample_columns: list[str]) -> dict[str, Any]:
     """Build a default QC grouping draft."""
     midpoint = max(1, len(sample_columns) // 2)
@@ -640,6 +701,30 @@ def get_unassigned_samples(groups: dict[str, list[str]], sample_columns: list[st
     return [sample for sample in sample_columns if sample not in assigned]
 
 
+def get_assigned_samples_by_group(groups: dict[str, list[str]]) -> dict[str, set[str]]:
+    """Return selected samples for each QC group as sets."""
+    return {group_name: set(samples) for group_name, samples in groups.items()}
+
+
+def get_available_samples_for_group(
+    group_name: str,
+    groups: dict[str, list[str]],
+    sample_columns: list[str],
+) -> list[str]:
+    """Return multiselect options with samples assigned elsewhere filtered out."""
+    current_group_samples = set(groups.get(group_name, []))
+    assigned_elsewhere = {
+        sample
+        for other_group, samples in groups.items()
+        if other_group != group_name
+        for sample in samples
+    }
+    return [
+        sample for sample in sample_columns
+        if sample not in assigned_elsewhere or sample in current_group_samples
+    ]
+
+
 def get_duplicate_assigned_samples(groups: dict[str, list[str]]) -> list[str]:
     """Return samples assigned to more than one QC group."""
     counts: dict[str, int] = {}
@@ -674,8 +759,28 @@ def save_qc_grouping_set(grouping_name: str, groups: dict[str, list[str]]) -> st
         group.strip(): list(samples) for group, samples in groups.items() if group.strip()
     }
     st.session_state["active_qc_grouping_set"] = clean_name
+    clear_qc_plot_cache()
     reset_analysis_state()
     return clean_name
+
+
+def add_qc_group_to_editor(sample_columns: list[str]) -> None:
+    """Add one empty group to the QC grouping draft."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    groups = editor["groups"]
+    next_index = len(groups) + 1
+    while f"Group {next_index}" in groups:
+        next_index += 1
+    groups[f"Group {next_index}"] = []
+    st.session_state["current_qc_group_editor"] = editor
+
+
+def remove_qc_group_from_editor(group_name: str, sample_columns: list[str]) -> None:
+    """Remove one group from the QC grouping draft."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    if len(editor["groups"]) > 2:
+        editor["groups"].pop(group_name, None)
+    st.session_state["current_qc_group_editor"] = normalize_qc_group_editor(editor, sample_columns)
 
 
 def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
@@ -731,6 +836,59 @@ def prepare_qc_plot_data(
         aggregation = "Mean"
         settings["aggregation"] = "Mean"
     return aggregate_sample_qc_by_group(sample_qc_df, grouping_dict, metric_col, aggregation)
+
+
+def make_qc_plot_cache_key(
+    plot_id: str,
+    metric_col: str,
+    settings: dict[str, Any],
+) -> str:
+    """Build a lightweight cache key for QC plot data, excluding visual-only settings."""
+    grouping_set = settings.get("grouping_set") if settings.get("plot_by") == "QC assignment group" else None
+    grouping_signature = ""
+    if grouping_set:
+        grouping_signature = json.dumps(
+            st.session_state.get("qc_grouping_sets", {}).get(grouping_set, {}),
+            sort_keys=True,
+        )
+    payload = {
+        "plot_id": plot_id,
+        "metric_col": metric_col,
+        "plot_by": settings.get("plot_by", "Sample name"),
+        "grouping_set": grouping_set,
+        "aggregation": settings.get("aggregation", "Mean"),
+        "qc_summary_signature": st.session_state.get("qc_summary_signature"),
+        "grouping_signature": grouping_signature,
+    }
+    return f"{plot_id}:{hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()}"
+
+
+def get_cached_qc_plot_data(
+    sample_qc_df: pd.DataFrame,
+    plot_id: str,
+    metric_col: str,
+    settings: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame | None, list[str], list[str], list[str]]:
+    """Return cached QC plot data; visual settings and colors do not invalidate it."""
+    cache_key = make_qc_plot_cache_key(plot_id, metric_col, settings)
+    cache = st.session_state.setdefault("qc_plot_data_cache", {})
+    if cache_key not in cache:
+        plot_df, overlay_df, missing_samples = prepare_qc_plot_data(sample_qc_df, plot_id, metric_col, settings)
+        cache[cache_key] = {
+            "plot_df": plot_df,
+            "overlay_df": overlay_df,
+            "missing_samples": missing_samples,
+            "entity_keys": list(plot_df["ColorKey"]) if "ColorKey" in plot_df else [],
+            "entity_labels": list(plot_df["Label"]) if "Label" in plot_df else [],
+        }
+    cached = cache[cache_key]
+    return (
+        cached["plot_df"],
+        cached["overlay_df"],
+        cached["missing_samples"],
+        cached["entity_keys"],
+        cached["entity_labels"],
+    )
 
 
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
@@ -805,6 +963,8 @@ def _reprocess_uploaded_counts() -> None:
     st.session_state["conversion_summary"] = conversion_summary
     st.session_state["duplicate_summary_df"] = duplicate_summary_df
     st.session_state["gene_id_mode"] = conversion_summary["gene_id_mode"]
+    compute_and_store_qc_summary()
+    clear_qc_plot_cache()
     reset_analysis_state()
 
 
@@ -889,6 +1049,9 @@ def render_upload_count_matrix_tab() -> None:
                 st.session_state["active_qc_grouping_set"] = None
                 st.session_state["qc_plot_settings"] = default_qc_plot_settings()
                 st.session_state["qc_export_bytes"] = {}
+                st.session_state["qc_plot_data_cache"] = {}
+                st.session_state["qc_summary"] = None
+                st.session_state["qc_summary_signature"] = None
                 _reprocess_uploaded_counts()
             except Exception as exc:
                 st.error(f"Could not read the uploaded count matrix: {exc}")
@@ -916,6 +1079,9 @@ def render_upload_count_matrix_tab() -> None:
         st.session_state["active_qc_grouping_set"] = None
         st.session_state["qc_plot_settings"] = default_qc_plot_settings()
         st.session_state["qc_export_bytes"] = {}
+        st.session_state["qc_plot_data_cache"] = {}
+        st.session_state["qc_summary"] = None
+        st.session_state["qc_summary_signature"] = None
         _reprocess_uploaded_counts()
 
     sample_columns = st.session_state["sample_columns"]
@@ -1001,11 +1167,15 @@ def make_qc_bar_plot(
         yaxis=dict(title=y_axis_title, showgrid=True, gridcolor="#E5E7EB", tickformat=y_tick_format),
         bargap=0.25,
         font=dict(size=13),
-        showlegend=overlay_df is not None and not overlay_df.empty,
+        showlegend=False,
     )
     return fig
 
 
+# Streamlit reruns the script on widget changes. v1.7 minimizes expensive
+# recomputation and uses form/session-state guards, but true instant drag/drop
+# or fully local UI updates would require a custom Streamlit component or a
+# React frontend.
 def render_qc_group_editor_form(sample_columns: list[str]) -> None:
     """Render a form-based QC grouping draft editor."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
@@ -1018,13 +1188,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
         entered_group_names: list[str] = []
         remove_index: int | None = None
         for index, (old_group_name, current_samples) in enumerate(group_items):
-            assigned_elsewhere = {
-                sample
-                for other_index, (_, samples) in enumerate(group_items)
-                if other_index != index
-                for sample in samples
-            }
-            options = [sample for sample in sample_columns if sample not in assigned_elsewhere or sample in current_samples]
+            options = get_available_samples_for_group(old_group_name, editor["groups"], sample_columns)
             cols = st.columns([2, 5, 1])
             with cols[0]:
                 new_group_name = st.text_input("Group name", value=old_group_name, key=f"qc_group_name_form_{index}")
@@ -1042,15 +1206,20 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             entered_group_names.append(clean_name)
             updated_groups[clean_name] = selected_samples
 
-        action_cols = st.columns([1, 1, 2])
+        action_cols = st.columns([1, 5, 1])
         with action_cols[0]:
-            apply_draft = st.form_submit_button("Apply grouping draft")
-        with action_cols[1]:
-            add_group = st.form_submit_button("Add group")
-        with action_cols[2]:
             save_grouping = st.form_submit_button("Save QC grouping", type="primary")
 
-    if apply_draft or add_group or save_grouping or remove_index is not None:
+    add_cols = st.columns([2, 5, 1])
+    with add_cols[2]:
+        st.button(
+            "Add group",
+            key="qc_group_add_button",
+            on_click=add_qc_group_to_editor,
+            args=(sample_columns,),
+        )
+
+    if save_grouping or remove_index is not None:
         duplicate_names = sorted({name for name in entered_group_names if entered_group_names.count(name) > 1})
         if save_grouping and duplicate_names:
             st.error(f"Group names must be unique: {', '.join(duplicate_names)}")
@@ -1058,11 +1227,6 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
         if remove_index is not None and len(updated_groups) > 2:
             name_to_remove = list(updated_groups.keys())[remove_index]
             updated_groups = {name: samples for name, samples in updated_groups.items() if name != name_to_remove}
-        if add_group:
-            next_index = len(updated_groups) + 1
-            while f"Group {next_index}" in updated_groups:
-                next_index += 1
-            updated_groups[f"Group {next_index}"] = []
         draft = normalize_qc_group_editor({"grouping_set_name": grouping_name, "groups": updated_groups}, sample_columns)
         st.session_state["current_qc_group_editor"] = draft
         if save_grouping:
@@ -1074,9 +1238,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             else:
                 saved_name = save_qc_grouping_set(draft["grouping_set_name"], draft["groups"])
                 st.success(f"Saved QC grouping: {saved_name}")
-        elif apply_draft:
-            st.success("Grouping draft applied.")
-        if add_group or remove_index is not None:
+        if remove_index is not None:
             st.rerun()
 
     draft_groups = st.session_state["current_qc_group_editor"]["groups"]
@@ -1102,6 +1264,7 @@ def render_qc_grouping_section(sample_columns: list[str]) -> None:
             st.session_state["qc_grouping_sets"].pop(active, None)
             remaining = list(st.session_state["qc_grouping_sets"].keys())
             st.session_state["active_qc_grouping_set"] = remaining[0] if remaining else None
+            clear_qc_plot_cache()
             st.rerun()
 
 
@@ -1132,7 +1295,7 @@ def render_qc_barplot_section(
         settings["aggregation"] = "Mean"
         st.session_state.pop(f"{plot_id}_aggregation", None)
 
-    control_cols = st.columns([1.1, 1.5, 1.0, 1.3])
+    control_cols = st.columns([1.1, 1.5, 1.0, 0.6])
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1141,8 +1304,9 @@ def render_qc_barplot_section(
             key=f"{plot_id}_plot_by",
         )
     plot_by_group = settings["plot_by"] == "QC assignment group"
+    effective_group_mode = plot_by_group and bool(grouping_names)
     with control_cols[1]:
-        if plot_by_group and grouping_names:
+        if effective_group_mode:
             selected_grouping = settings.get("grouping_set") if settings.get("grouping_set") in grouping_names else grouping_names[0]
             settings["grouping_set"] = st.selectbox(
                 "QC assignment set",
@@ -1157,7 +1321,7 @@ def render_qc_barplot_section(
                 disabled=True,
                 key=f"{plot_id}_grouping_set_disabled",
             )
-            if not plot_by_group:
+            if not effective_group_mode:
                 settings["grouping_set"] = None
     with control_cols[2]:
         aggregation_options = ["Mean", "Median"] if plot_id == "zero_fraction" else ["Mean", "Median", "Sum"]
@@ -1165,10 +1329,11 @@ def render_qc_barplot_section(
             "Aggregation",
             aggregation_options,
             index=aggregation_options.index(settings.get("aggregation", "Mean")),
-            disabled=not plot_by_group,
+            disabled=not effective_group_mode,
             key=f"{plot_id}_aggregation",
         )
     with control_cols[3]:
+        st.write("")
         if st.button("Reset", key=f"{plot_id}_reset"):
             reset_qc_plot_setting(plot_id)
             st.rerun()
@@ -1192,15 +1357,18 @@ def render_qc_barplot_section(
         st.warning("Please create and save a QC grouping set first.")
         settings["plot_by"] = "Sample name"
 
-    plot_df, overlay_df, missing_samples = prepare_qc_plot_data(sample_qc_df, plot_id, metric_col, settings)
+    plot_df, overlay_df, missing_samples, entity_keys, entity_labels = get_cached_qc_plot_data(
+        sample_qc_df,
+        plot_id,
+        metric_col,
+        settings,
+    )
     if missing_samples:
         st.warning(f"Ignored samples not found in QC table: {', '.join(missing_samples[:8])}")
     if plot_df.empty:
         st.warning("No valid samples are assigned in the selected QC grouping set.")
         return
 
-    entity_keys = list(plot_df["ColorKey"])
-    entity_labels = list(plot_df["Label"])
     with st.expander("Color settings"):
         render_qc_color_settings(plot_id, entity_keys, entity_labels)
 
@@ -1223,12 +1391,28 @@ def render_qc_barplot_section(
         overlay_df=overlay_df,
     )
 
-    st.plotly_chart(fig, use_container_width=False)
+    st.plotly_chart(fig, use_container_width=False, key=f"{plot_id}_plotly_chart")
+    export_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "plot_by": settings.get("plot_by"),
+                "grouping_set": settings.get("grouping_set"),
+                "aggregation": settings.get("aggregation"),
+                "width": settings.get("width"),
+                "height": settings.get("height"),
+                "x_axis_angle": settings.get("x_axis_angle"),
+                "colors": settings.get("colors", {}),
+                "qc_summary_signature": st.session_state.get("qc_summary_signature"),
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:8]
+    filename_base = f"{plot_id}_{APP_VERSION}_{export_signature}"
     export_cols = st.columns([1, 1, 4])
     with export_cols[0]:
-        export_plotly_figure(fig, f"{plot_id}_{APP_VERSION}", "png")
+        export_plotly_figure(fig, filename_base, "png")
     with export_cols[1]:
-        export_plotly_figure(fig, f"{plot_id}_{APP_VERSION}", "svg")
+        export_plotly_figure(fig, filename_base, "svg")
 
 
 def export_plotly_figure(fig: go.Figure, filename_base: str, format: str) -> None:
@@ -1270,7 +1454,10 @@ def render_quality_control_tab() -> None:
         st.warning("No sample columns are available for QC.")
         return
 
-    qc_summary = compute_qc_summary(processed_counts_df, sample_columns)
+    qc_summary = get_cached_qc_summary()
+    if qc_summary is None:
+        st.warning("QC summary is unavailable for the current count matrix.")
+        return
     sample_qc_df = qc_summary["sample_qc_df"]
 
     st.markdown("### Dataset summary")
