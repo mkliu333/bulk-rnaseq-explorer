@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Environments
+.venv/
+venv/
+env/
+*.conda
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Outputs / analysis results
+outputs/
+results/
+cache/
+tmp/
+temp/
+
+# Large raw data
+*.fastq
+*.fastq.gz
+*.bam
+*.sam
+*.cram
+
+# Generated cache files
+assets/*.parquet
