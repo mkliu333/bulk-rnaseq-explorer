@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_10
+Version: bulk_rnaseq_explorer_v1_11
 
-Scope for v1.10:
+Scope for v1.11:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -10,6 +10,7 @@ Scope for v1.10:
 - Produce a clean processed count matrix for future QC.
 - Fix Quality Control grouping editor save/reset behavior and barplot reset state.
 - Use placeholder-based QC grouping inputs and nonce-based QC plot widgets.
+- Polish Quality Control button responsiveness and barplot axis label controls.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -43,7 +44,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_10"
+APP_VERSION = "bulk_rnaseq_explorer_v1_11"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -134,6 +135,7 @@ def init_session_state() -> None:
         setting = plot_settings.setdefault(plot_id, get_default_qc_plot_setting(plot_id))
         for setting_key, setting_value in get_default_qc_plot_setting(plot_id).items():
             setting.setdefault(setting_key, setting_value)
+        sync_qc_axis_label_font_size(setting)
     plot_reset_nonce = st.session_state.setdefault("qc_plot_reset_nonce", {})
     for plot_id in QC_PLOT_DEFINITIONS:
         plot_reset_nonce.setdefault(plot_id, 0)
@@ -645,9 +647,17 @@ def get_default_qc_plot_setting(plot_id: str) -> dict[str, Any]:
         "width": 980,
         "height": 480,
         "x_axis_angle": 45,
+        "axis_label_font_size": 14,
         "axis_title_font_size": 14,
         "colors": {},
     }
+
+
+def sync_qc_axis_label_font_size(settings: dict[str, Any]) -> int:
+    """Keep v1.11 axis-label sizing compatible with v1.10 session state."""
+    if "axis_label_font_size" not in settings:
+        settings["axis_label_font_size"] = settings.get("axis_title_font_size", 14)
+    return int(settings.get("axis_label_font_size", 14))
 
 
 def reset_qc_plot_setting(plot_id: str) -> None:
@@ -663,6 +673,7 @@ def reset_qc_plot_setting(plot_id: str) -> None:
         "width",
         "height",
         "x_axis_angle",
+        "axis_label_font_size",
         "axis_title_font_size",
     ]
     legacy_prefixes = [f"{plot_id}_{suffix}" for suffix in widget_suffixes]
@@ -1297,13 +1308,12 @@ def make_qc_bar_plot(
     title: str,
     x_col: str,
     y_col: str,
-    x_axis_title: str,
     y_axis_title: str,
     width: int,
     height: int,
     x_axis_angle: int,
     colors: dict[str, str],
-    axis_title_font_size: int = 14,
+    axis_label_font_size: int = 14,
     y_tick_format: str | None = None,
     overlay_df: pd.DataFrame | None = None,
 ) -> go.Figure:
@@ -1358,13 +1368,19 @@ def make_qc_bar_plot(
         plot_bgcolor="white",
         paper_bgcolor="white",
         margin=dict(l=70, r=30, t=70, b=110),
-        xaxis=dict(tickangle=x_axis_angle, title=x_axis_title, showgrid=False, title_font=dict(size=axis_title_font_size)),
+        xaxis=dict(
+            tickangle=x_axis_angle,
+            title="",
+            showgrid=False,
+            tickfont=dict(size=axis_label_font_size),
+        ),
         yaxis=dict(
             title=y_axis_title,
             showgrid=True,
             gridcolor="#E5E7EB",
             tickformat=y_tick_format,
-            title_font=dict(size=axis_title_font_size),
+            title_font=dict(size=axis_label_font_size),
+            tickfont=dict(size=axis_label_font_size),
         ),
         bargap=0.25,
         font=dict(size=13),
@@ -1438,19 +1454,22 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     disabled=len(editor["groups"]) <= 2,
                     on_click=remove_qc_group_from_editor,
                     args=(group_id, sample_columns),
+                    help="Remove this group",
                 )
 
-        action_cols = st.columns([1.25, 1.35, 3.4, 1.05])
-        with action_cols[0]:
-            save_grouping = st.button("Save QC grouping", key="qc_group_save_button", type="primary")
-        with action_cols[1]:
-            st.button(
-                "Clear grouping info",
-                key="qc_group_clear_button",
-                on_click=clear_qc_group_editor,
-                args=(sample_columns,),
-            )
-        with action_cols[3]:
+        action_left, _, action_right = st.columns([2.4, 4.6, 1.2])
+        with action_left:
+            save_col, clear_col = st.columns([1.0, 1.15])
+            with save_col:
+                save_grouping = st.button("Save QC grouping", key="qc_group_save_button", type="primary")
+            with clear_col:
+                st.button(
+                    "Clear grouping info",
+                    key="qc_group_clear_button",
+                    on_click=clear_qc_group_editor,
+                    args=(sample_columns,),
+                )
+        with action_right:
             st.button(
                 "Add group",
                 key="qc_group_add_button",
@@ -1528,13 +1547,13 @@ def render_qc_barplot_section(
         settings["grouping_set"] = st.session_state.get("active_qc_grouping_set") if st.session_state.get("active_qc_grouping_set") in grouping_sets else None
     if settings.get("plot_by") not in {"Sample name", "QC assignment group"}:
         settings["plot_by"] = "Sample name"
-    settings.setdefault("axis_title_font_size", 14)
+    axis_label_font_size = sync_qc_axis_label_font_size(settings)
     if plot_id == "zero_fraction" and settings.get("aggregation") == "Sum":
         settings["aggregation"] = "Mean"
         st.session_state.pop(f"{plot_id}_aggregation", None)
     nonce = st.session_state.setdefault("qc_plot_reset_nonce", {}).setdefault(plot_id, 0)
 
-    control_cols = st.columns([1.1, 1.45, 0.95, 0.55, 0.75, 0.75])
+    control_cols = st.columns([1.15, 1.45, 0.9, 0.55, 0.8, 0.8])
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1583,21 +1602,21 @@ def render_qc_barplot_section(
         with adv_cols[1]:
             settings["height"] = st.slider("Plot height", 360, 900, int(settings.get("height", 480)), 20, key=f"{plot_id}*height*{nonce}")
         with adv_cols[2]:
+            settings["axis_label_font_size"] = st.slider(
+                "Axis label font size",
+                10,
+                28,
+                axis_label_font_size,
+                1,
+                key=f"{plot_id}*axis_label_font_size*{nonce}",
+            )
+        with adv_cols[3]:
             angle_options = [0, 30, 45, 60, 90]
             settings["x_axis_angle"] = st.selectbox(
                 "X-axis angle",
                 angle_options,
                 index=angle_options.index(int(settings.get("x_axis_angle", 45))),
                 key=f"{plot_id}*x_axis_angle*{nonce}",
-            )
-        with adv_cols[3]:
-            settings["axis_title_font_size"] = st.slider(
-                "Axis title font size",
-                10,
-                28,
-                int(settings.get("axis_title_font_size", 14)),
-                1,
-                key=f"{plot_id}*axis_title_font_size*{nonce}",
             )
 
     if plot_by_group and not grouping_names:
@@ -1629,13 +1648,12 @@ def render_qc_barplot_section(
         title,
         "Label",
         "Value",
-        "QC group" if settings["plot_by"] == "QC assignment group" else "Sample",
         y_axis_title,
         int(settings["width"]),
         int(settings["height"]),
         int(settings["x_axis_angle"]),
         color_map,
-        axis_title_font_size=int(settings.get("axis_title_font_size", 14)),
+        axis_label_font_size=int(settings.get("axis_label_font_size", 14)),
         y_tick_format=y_tick_format,
         overlay_df=overlay_df,
     )
@@ -1649,7 +1667,7 @@ def render_qc_barplot_section(
                 "width": settings.get("width"),
                 "height": settings.get("height"),
                 "x_axis_angle": settings.get("x_axis_angle"),
-                "axis_title_font_size": settings.get("axis_title_font_size"),
+                "axis_label_font_size": settings.get("axis_label_font_size"),
                 "colors": settings.get("colors", {}),
                 "qc_summary_signature": st.session_state.get("qc_summary_signature"),
             },
@@ -1696,22 +1714,24 @@ def render_qc_export_buttons(
     with png_column:
         st.write("")
         st.download_button(
-            "Download PNG",
+            "PNG",
             data=png_bytes or b"",
             file_name=f"{filename_base}.png",
             mime="image/png",
             disabled=png_bytes is None,
             key=f"{plot_id}*download*png*{filename_base}*{nonce}",
+            help="Download PNG",
         )
     with svg_column:
         st.write("")
         st.download_button(
-            "Download SVG",
+            "SVG",
             data=svg_bytes or b"",
             file_name=f"{filename_base}.svg",
             mime="image/svg+xml",
             disabled=svg_bytes is None,
             key=f"{plot_id}*download*svg*{filename_base}*{nonce}",
+            help="Download SVG",
         )
     if png_bytes is None or svg_bytes is None:
         st.warning("Static image export requires kaleido. Install with: pip install kaleido")
@@ -1770,6 +1790,23 @@ def main() -> None:
             justify-content: center;
             display: flex;
             align-items: center;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-size: clamp(0.72rem, 0.85vw, 0.95rem);
+            padding-left: clamp(0.35rem, 0.7vw, 0.75rem);
+            padding-right: clamp(0.35rem, 0.7vw, 0.75rem);
+        }
+
+        div[data-testid="stButton"] button p,
+        div[data-testid="stDownloadButton"] button p,
+        div[data-testid="stButton"] button span,
+        div[data-testid="stDownloadButton"] button span {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin: 0;
         }
         </style>
         """,
