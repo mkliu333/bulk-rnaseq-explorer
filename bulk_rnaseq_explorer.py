@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_11
+Version: bulk_rnaseq_explorer_v1_12
 
-Scope for v1.11:
+Scope for v1.12:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -11,6 +11,7 @@ Scope for v1.11:
 - Fix Quality Control grouping editor save/reset behavior and barplot reset state.
 - Use placeholder-based QC grouping inputs and nonce-based QC plot widgets.
 - Polish Quality Control button responsiveness and barplot axis label controls.
+- Tighten Quality Control action-button rows on wide and narrow screens.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -44,7 +45,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_11"
+APP_VERSION = "bulk_rnaseq_explorer_v1_12"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -1457,24 +1458,29 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     help="Remove this group",
                 )
 
-        action_left, _, action_right = st.columns([2.4, 4.6, 1.2])
-        with action_left:
-            save_col, clear_col = st.columns([1.0, 1.15])
-            with save_col:
-                save_grouping = st.button("Save QC grouping", key="qc_group_save_button", type="primary")
-            with clear_col:
-                st.button(
-                    "Clear grouping info",
-                    key="qc_group_clear_button",
-                    on_click=clear_qc_group_editor,
-                    args=(sample_columns,),
-                )
-        with action_right:
+        action_cols = st.columns([0.95, 1.15, 4.8, 0.9])
+        with action_cols[0]:
+            save_grouping = st.button(
+                "Save QC grouping",
+                key="qc_group_save_button",
+                type="primary",
+                use_container_width=True,
+            )
+        with action_cols[1]:
+            st.button(
+                "Clear grouping info",
+                key="qc_group_clear_button",
+                on_click=clear_qc_group_editor,
+                args=(sample_columns,),
+                use_container_width=True,
+            )
+        with action_cols[3]:
             st.button(
                 "Add group",
                 key="qc_group_add_button",
                 on_click=add_qc_group_to_editor,
                 args=(sample_columns,),
+                use_container_width=True,
             )
 
     if save_grouping:
@@ -1553,7 +1559,7 @@ def render_qc_barplot_section(
         st.session_state.pop(f"{plot_id}_aggregation", None)
     nonce = st.session_state.setdefault("qc_plot_reset_nonce", {}).setdefault(plot_id, 0)
 
-    control_cols = st.columns([1.15, 1.45, 0.9, 0.55, 0.8, 0.8])
+    control_cols = st.columns([1.15, 1.45, 0.9, 0.55, 0.55, 0.55, 3.2])
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1592,7 +1598,7 @@ def render_qc_barplot_section(
         )
     with control_cols[3]:
         st.write("")
-        if st.button("Reset", key=f"{plot_id}_reset"):
+        if st.button("Reset", key=f"{plot_id}_reset", use_container_width=True):
             reset_qc_plot_setting(plot_id)
 
     with st.expander("Advanced settings"):
@@ -1721,6 +1727,7 @@ def render_qc_export_buttons(
             disabled=png_bytes is None,
             key=f"{plot_id}*download*png*{filename_base}*{nonce}",
             help="Download PNG",
+            use_container_width=True,
         )
     with svg_column:
         st.write("")
@@ -1732,6 +1739,7 @@ def render_qc_export_buttons(
             disabled=svg_bytes is None,
             key=f"{plot_id}*download*svg*{filename_base}*{nonce}",
             help="Download SVG",
+            use_container_width=True,
         )
     if png_bytes is None or svg_bytes is None:
         st.warning("Static image export requires kaleido. Install with: pip install kaleido")
