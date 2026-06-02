@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_15
+Version: bulk_rnaseq_explorer_v2_0
 
-Scope for v1.15:
+Scope for v2.0:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -15,6 +15,7 @@ Scope for v1.15:
 - Use adaptive QC button widths without truncating labels.
 - Refactor Quality Control action rows into compact responsive clusters.
 - Align Quality Control buttons to their related input grids with small gaps.
+- Add a Normalization workflow driven by DESeq2 and edgeR through Rscript.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -28,8 +29,7 @@ Optional for faster gene-map cache:
 pip install pyarrow
 
 Explicitly out of scope:
-- DESeq2, Rscript, DEG analysis, normalization, PCA, sample correlation,
-- heatmap, volcano plot,
+- DEG analysis, PCA, sample correlation, heatmap, volcano plot,
   GSEA, ORA, pathway enrichment, cloud storage, login, Duke DCC, SLURM.
 """
 
@@ -39,16 +39,24 @@ import csv
 import hashlib
 import json
 import re
+import subprocess
+import tempfile
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - surfaced in the Normalization UI.
+    np = None
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_15"
+APP_VERSION = "bulk_rnaseq_explorer_v2_0"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -78,6 +86,21 @@ QC_PLOT_DEFINITIONS = {
         "y_axis_title": "Zero-count fraction",
         "y_tick_format": ".0%",
     },
+}
+
+NORMALIZATION_OUTPUTS = {
+    "Raw counts": "raw_counts.csv",
+    "CPM": "cpm.csv",
+    "log2(CPM + 1)": "log2_cpm_plus1.csv",
+    "DESeq2 normalized counts": "deseq2_normalized_counts.csv",
+    "DESeq2 VST": "deseq2_vst.csv",
+    "edgeR TMM CPM": "edger_tmm_cpm.csv",
+    "edgeR TMM logCPM": "edger_tmm_logcpm.csv",
+}
+
+NORMALIZATION_FACTOR_FILES = {
+    "DESeq2 size factors": "deseq2_size_factors.csv",
+    "edgeR TMM normalization factors": "edger_tmm_norm_factors.csv",
 }
 
 TEMPLATE_TEXT = """EnsemblID / Gene_symbol\tSample_1\tSample_2\tSample_3\tSample_4
@@ -114,6 +137,16 @@ def init_session_state() -> None:
         "qc_summary": None,
         "qc_summary_signature": None,
         "qc_plot_data_cache": {},
+        "normalization_results": None,
+        "normalization_output_dir": None,
+        "normalization_report": None,
+        "normalization_tables": {},
+        "normalization_run_status": None,
+        "normalization_input_signature": None,
+        "normalization_selected_matrix": "Raw counts",
+        "normalization_table_page": 1,
+        "normalization_table_rows_per_page": 25,
+        "normalization_table_search": "",
         "gene_map_df": None,
         "gene_map_status": {
             "detected": False,
@@ -148,6 +181,16 @@ def init_session_state() -> None:
     st.session_state.setdefault("qc_summary_signature", None)
     st.session_state.setdefault("qc_plot_data_cache", {})
     st.session_state.setdefault("qc_group_id_counter", 2)
+    st.session_state.setdefault("normalization_results", None)
+    st.session_state.setdefault("normalization_output_dir", None)
+    st.session_state.setdefault("normalization_report", None)
+    st.session_state.setdefault("normalization_tables", {})
+    st.session_state.setdefault("normalization_run_status", None)
+    st.session_state.setdefault("normalization_input_signature", None)
+    st.session_state.setdefault("normalization_selected_matrix", "Raw counts")
+    st.session_state.setdefault("normalization_table_page", 1)
+    st.session_state.setdefault("normalization_table_rows_per_page", 25)
+    st.session_state.setdefault("normalization_table_search", "")
 
 
 def default_conversion_summary() -> dict[str, Any]:
@@ -190,6 +233,7 @@ def clear_count_matrix_state() -> None:
     st.session_state["gene_id_mode"] = "unknown"
     st.session_state["conversion_summary"] = default_conversion_summary()
     st.session_state["duplicate_summary_df"] = pd.DataFrame(columns=["Gene", "Original IDs", "Number of duplicated rows"])
+    clear_normalization_state()
     reset_analysis_state()
 
 
@@ -199,6 +243,20 @@ def reset_analysis_state() -> None:
     st.session_state["deg_results"] = None
     st.session_state["pathway_results"] = None
     st.session_state["plots"] = None
+
+
+def clear_normalization_state() -> None:
+    """Clear normalization outputs when the processed count matrix changes."""
+    st.session_state["normalization_results"] = None
+    st.session_state["normalization_output_dir"] = None
+    st.session_state["normalization_report"] = None
+    st.session_state["normalization_tables"] = {}
+    st.session_state["normalization_run_status"] = None
+    st.session_state["normalization_input_signature"] = None
+    st.session_state["normalization_selected_matrix"] = "Raw counts"
+    st.session_state["normalization_table_page"] = 1
+    st.session_state["normalization_table_rows_per_page"] = 25
+    st.session_state["normalization_table_search"] = ""
 
 
 def read_count_matrix_file(uploaded_file) -> pd.DataFrame:
@@ -1138,10 +1196,11 @@ def render_sidebar() -> None:
     st.sidebar.title("Workflow")
     st.sidebar.success("1. Upload Count Matrix")
     st.sidebar.success("2. Quality Control")
-    st.sidebar.caption("3. DEG Analysis - Coming soon / Locked")
-    st.sidebar.caption("4. Visualization - Coming soon / Locked")
-    st.sidebar.caption("5. Pathway Analysis - Coming soon / Locked")
-    st.sidebar.caption("6. Export - Coming soon / Locked")
+    st.sidebar.success("3. Normalization")
+    st.sidebar.caption("4. DEG Analysis - Coming soon / Locked")
+    st.sidebar.caption("5. Visualization - Coming soon / Locked")
+    st.sidebar.caption("6. Pathway Analysis - Coming soon / Locked")
+    st.sidebar.caption("7. Export - Coming soon / Locked")
 
 
 def _uploaded_file_signature(uploaded_file) -> str:
@@ -1166,6 +1225,7 @@ def _reprocess_uploaded_counts() -> None:
     st.session_state["conversion_summary"] = conversion_summary
     st.session_state["duplicate_summary_df"] = duplicate_summary_df
     st.session_state["gene_id_mode"] = conversion_summary["gene_id_mode"]
+    clear_normalization_state()
     compute_and_store_qc_summary()
     clear_qc_plot_cache()
     reset_analysis_state()
@@ -1749,6 +1809,457 @@ def render_qc_export_buttons(
         st.warning("Static image export requires kaleido. Install with: pip install kaleido")
 
 
+def validate_normalization_input(counts_df: pd.DataFrame | None, sample_columns: list[str]) -> dict[str, Any]:
+    """Validate the processed raw count matrix used by normalization."""
+    result: dict[str, Any] = {
+        "valid": False,
+        "errors": [],
+        "warnings": [],
+        "summary": {},
+        "total_counts_df": pd.DataFrame(columns=["Sample", "Total counts"]),
+        "numeric_counts": None,
+    }
+    if counts_df is None or counts_df.empty:
+        result["errors"].append("Processed count matrix is empty.")
+        return result
+    if "Gene" not in counts_df.columns:
+        result["errors"].append("Processed count matrix must contain a Gene column.")
+        return result
+    if len(sample_columns) < 2:
+        result["errors"].append("At least two sample columns are required for normalization.")
+        return result
+    missing_samples = [sample for sample in sample_columns if sample not in counts_df.columns]
+    if missing_samples:
+        result["errors"].append(f"Sample columns missing from processed matrix: {', '.join(missing_samples[:8])}")
+        return result
+
+    gene_series = counts_df["Gene"].astype("string").fillna("").str.strip()
+    empty_genes = int((gene_series == "").sum())
+    duplicated_genes = int(gene_series[gene_series != ""].duplicated().sum())
+    numeric_counts = counts_df[sample_columns].apply(pd.to_numeric, errors="coerce")
+    if numeric_counts.isna().any().any():
+        result["errors"].append("Non-numeric count values detected.")
+    if (numeric_counts < 0).any().any():
+        result["errors"].append("Negative count values detected.")
+    if empty_genes:
+        result["errors"].append(f"Empty gene IDs detected: {empty_genes}")
+
+    filled_counts = numeric_counts.fillna(0)
+    all_zero_genes = int((filled_counts.sum(axis=1) == 0).sum())
+    total_counts = filled_counts.sum(axis=0)
+    deviations = (filled_counts - filled_counts.round()).abs()
+    max_deviation = float(deviations.max().max()) if not deviations.empty else 0.0
+    non_integer_mask = deviations > 1e-6
+    non_integer_fraction = float(non_integer_mask.to_numpy().sum() / filled_counts.size) if filled_counts.size else 0.0
+    if max_deviation > 1e-6 or non_integer_fraction > 0:
+        result["warnings"].append(
+            "Non-integer count values detected. DESeq2 and edgeR will use rounded counts in the R workflow."
+        )
+    sample_totals_near_cpm = bool(((total_counts - 1_000_000).abs() < 50_000).all()) if len(total_counts) else False
+    if sample_totals_near_cpm and non_integer_fraction > 0.05:
+        result["warnings"].append("Input may be TPM/CPM-like because sample totals are near 1e6 and decimals are common.")
+
+    result["valid"] = not result["errors"]
+    result["summary"] = {
+        "genes": int(counts_df.shape[0]),
+        "samples": int(len(sample_columns)),
+        "duplicated_gene_ids": duplicated_genes,
+        "all_zero_genes": all_zero_genes,
+        "max_deviation_from_integer": max_deviation,
+        "non_integer_value_fraction": non_integer_fraction,
+    }
+    result["total_counts_df"] = pd.DataFrame(
+        {"Sample": list(total_counts.index), "Total counts": [float(value) for value in total_counts.values]}
+    )
+    result["numeric_counts"] = numeric_counts
+    return result
+
+
+def get_normalization_input_signature() -> str:
+    """Return a signature for the current processed matrix and selected sample columns."""
+    payload = {
+        "counts": st.session_state.get("counts_file_signature"),
+        "gene_id_column": st.session_state.get("gene_id_column"),
+        "samples": st.session_state.get("sample_columns", []),
+        "processed_shape": getattr(st.session_state.get("processed_counts_df"), "shape", None),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def create_normalization_output_dir() -> Path:
+    """Create a unique output directory for one normalization run."""
+    base_dir = Path.cwd() / "outputs" / "normalization"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    signature = st.session_state.get("counts_file_signature")
+    if signature:
+        short_hash = str(signature)[:8]
+    else:
+        short_hash = hashlib.sha256(f"{timestamp}:{tempfile.gettempdir()}".encode("utf-8")).hexdigest()[:8]
+    output_dir = base_dir / f"{APP_VERSION}_{timestamp}_{short_hash}"
+    output_dir.mkdir(parents=True, exist_ok=False)
+    return output_dir
+
+
+def prepare_normalization_input(
+    processed_counts_df: pd.DataFrame,
+    sample_columns: list[str],
+    output_dir: Path,
+) -> Path:
+    """Write the processed raw count matrix that will be consumed by the R workflow."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_df = processed_counts_df[["Gene", *sample_columns]].copy()
+    input_df["Gene"] = input_df["Gene"].astype(str)
+    for sample in sample_columns:
+        input_df[sample] = pd.to_numeric(input_df[sample], errors="coerce")
+    input_path = output_dir / "input_processed_raw_counts.csv"
+    input_df.to_csv(input_path, index=False)
+    return input_path
+
+
+def run_r_normalization(
+    counts_path: Path,
+    output_dir: Path,
+    gene_col: str = "Gene",
+    prior_count: float = 1.0,
+) -> dict[str, Any]:
+    """Run the standalone R normalization script and capture its process output."""
+    try:
+        subprocess.run(["Rscript", "--version"], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Rscript was not found. Please install R and make sure Rscript is available in PATH.",
+            "returncode": None,
+            "command": ["Rscript", "--version"],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"Could not check Rscript availability: {exc}",
+            "returncode": None,
+            "command": ["Rscript", "--version"],
+        }
+
+    script_path = Path.cwd() / "r_scripts" / "normalize_counts.R"
+    command = [
+        "Rscript",
+        str(script_path),
+        "--counts",
+        str(counts_path),
+        "--outdir",
+        str(output_dir),
+        "--gene_col",
+        gene_col,
+        "--prior_count",
+        str(prior_count),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        return {
+            "success": completed.returncode == 0,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "returncode": completed.returncode,
+            "command": command,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "success": False,
+            "stdout": exc.stdout or "",
+            "stderr": "R normalization timed out after 600 seconds.",
+            "returncode": None,
+            "command": command,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"R normalization failed before completion: {exc}",
+            "returncode": None,
+            "command": command,
+        }
+
+
+def load_normalization_report(output_dir: Path) -> dict[str, Any] | None:
+    """Load normalization_report.json if it exists."""
+    report_path = output_dir / "normalization_report.json"
+    if not report_path.exists():
+        return None
+    return json.loads(report_path.read_text(encoding="utf-8"))
+
+
+def load_normalization_table(output_dir: Path, label: str) -> pd.DataFrame:
+    """Load and cache one normalization matrix table by label."""
+    filename = NORMALIZATION_OUTPUTS[label]
+    cache_key = f"{output_dir.resolve()}:{filename}"
+    cache = st.session_state.setdefault("normalization_tables", {})
+    if cache_key not in cache:
+        cache[cache_key] = pd.read_csv(output_dir / filename)
+    return cache[cache_key]
+
+
+def get_normalization_output_dimensions(output_dir: Path) -> pd.DataFrame:
+    """Return generated/missing status and dimensions for normalization matrix outputs."""
+    rows: list[dict[str, Any]] = []
+    for label, filename in NORMALIZATION_OUTPUTS.items():
+        path = output_dir / filename
+        if not path.exists():
+            rows.append({"Matrix": label, "File": filename, "Genes": None, "Samples": None, "Status": "Missing"})
+            continue
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, [])
+            genes = sum(1 for _ in reader)
+        rows.append(
+            {
+                "Matrix": label,
+                "File": filename,
+                "Genes": genes,
+                "Samples": max(len(header) - 1, 0),
+                "Status": "Generated",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_normalization_workflow() -> None:
+    """Prepare input, run R normalization, and store output metadata in session state."""
+    processed_counts_df = st.session_state.get("processed_counts_df")
+    sample_columns = st.session_state.get("sample_columns", [])
+    validation = validate_normalization_input(processed_counts_df, sample_columns)
+    if not validation["valid"]:
+        st.session_state["normalization_run_status"] = {
+            "success": False,
+            "stderr": "\n".join(validation["errors"]),
+            "stdout": "",
+            "returncode": None,
+            "command": [],
+        }
+        return
+
+    output_dir = create_normalization_output_dir()
+    input_path = prepare_normalization_input(processed_counts_df, sample_columns, output_dir)
+    run_status = run_r_normalization(input_path, output_dir)
+    st.session_state["normalization_run_status"] = run_status
+    st.session_state["normalization_output_dir"] = str(output_dir)
+    st.session_state["normalization_input_signature"] = get_normalization_input_signature()
+    st.session_state["normalization_tables"] = {}
+    if run_status["success"]:
+        report = load_normalization_report(output_dir)
+        dimensions = get_normalization_output_dimensions(output_dir)
+        factor_tables = {}
+        for label, filename in NORMALIZATION_FACTOR_FILES.items():
+            path = output_dir / filename
+            factor_tables[label] = pd.read_csv(path) if path.exists() else pd.DataFrame()
+        st.session_state["normalization_report"] = report
+        st.session_state["normalization_results"] = {
+            "output_dir": str(output_dir),
+            "dimensions": dimensions,
+            "factor_tables": factor_tables,
+        }
+        st.session_state["normalization_selected_matrix"] = "Raw counts"
+        st.session_state["normalization_table_page"] = 1
+    else:
+        st.session_state["normalization_results"] = None
+        st.session_state["normalization_report"] = None
+
+
+def render_matrix_table_viewer(
+    table_df: pd.DataFrame,
+    table_name: str,
+    download_filename: str,
+    key_prefix: str,
+) -> None:
+    """Render a searchable, paginated matrix preview with CSV download."""
+    if table_df.empty:
+        st.warning(f"{table_name} is empty.")
+        return
+    search_key = f"{key_prefix}_search"
+    rows_key = f"{key_prefix}_rows_per_page"
+    page_key = f"{key_prefix}_page"
+    previous_search_key = f"{key_prefix}_previous_search"
+    previous_rows_key = f"{key_prefix}_previous_rows"
+    st.session_state.setdefault(search_key, "")
+    st.session_state.setdefault(rows_key, 25)
+    st.session_state.setdefault(page_key, 1)
+
+    control_cols = st.columns([2.4, 1.0, 0.6, 0.6, 0.8, 2.0], gap="small")
+    with control_cols[0]:
+        search_query = st.text_input(
+            "Search genes",
+            key=search_key,
+            placeholder="Type at least 3 characters...",
+        )
+    with control_cols[1]:
+        rows_per_page = st.selectbox(
+            "Show rows",
+            [10, 25, 50, 100, 250],
+            index=[10, 25, 50, 100, 250].index(int(st.session_state.get(rows_key, 25))),
+            key=rows_key,
+        )
+
+    if (
+        st.session_state.get(previous_search_key) != search_query
+        or st.session_state.get(previous_rows_key) != rows_per_page
+    ):
+        st.session_state[page_key] = 1
+        st.session_state[previous_search_key] = search_query
+        st.session_state[previous_rows_key] = rows_per_page
+
+    gene_series = table_df["Gene"].astype(str) if "Gene" in table_df.columns else pd.Series([], dtype=str)
+    search_active = len(search_query.strip()) >= 3
+    if search_active:
+        mask = gene_series.str.contains(re.escape(search_query.strip()), case=False, na=False)
+        display_df = table_df.loc[mask].copy()
+        suggestions = display_df["Gene"].astype(str).head(10).tolist() if "Gene" in display_df.columns else []
+        if suggestions:
+            st.caption("Suggestions: " + " / ".join(f"`{gene}`" for gene in suggestions))
+        else:
+            st.caption("No matched genes found.")
+    else:
+        display_df = table_df
+
+    total_rows = int(display_df.shape[0])
+    rows_per_page = int(rows_per_page)
+    total_pages = max((total_rows + rows_per_page - 1) // rows_per_page, 1)
+    st.session_state[page_key] = min(max(int(st.session_state.get(page_key, 1)), 1), total_pages)
+    page = int(st.session_state[page_key])
+    start = (page - 1) * rows_per_page
+    end = min(start + rows_per_page, total_rows)
+    page_df = display_df.iloc[start:end].copy()
+
+    st.write(f"Matrix shape: `{table_df.shape[0]:,}` genes x `{max(table_df.shape[1] - 1, 0):,}` samples")
+    if search_active:
+        st.write(f"Search matched `{total_rows:,}` genes")
+    st.write(f"Showing rows `{start + 1 if total_rows else 0:,}`-`{end:,}` of `{total_rows:,}`")
+
+    with control_cols[2]:
+        align_button_with_input()
+        if st.button("Previous", key=f"{key_prefix}_previous", disabled=page <= 1):
+            st.session_state[page_key] = max(page - 1, 1)
+            st.rerun()
+    with control_cols[3]:
+        align_button_with_input()
+        if st.button("Next", key=f"{key_prefix}_next", disabled=page >= total_pages):
+            st.session_state[page_key] = min(page + 1, total_pages)
+            st.rerun()
+    with control_cols[4]:
+        align_button_with_input()
+        st.download_button(
+            "CSV",
+            data=display_df.to_csv(index=False).encode("utf-8"),
+            file_name=download_filename,
+            mime="text/csv",
+            key=f"{key_prefix}_csv",
+        )
+    st.caption(f"Page {page} of {total_pages}")
+    st.dataframe(page_df, use_container_width=True, hide_index=True)
+
+
+def render_normalization_report(report: dict[str, Any] | None) -> None:
+    """Render a compact normalization report summary."""
+    if not report:
+        return
+    st.markdown("### Normalization report")
+    report_fields = [
+        ("Original genes", "original_genes"),
+        ("Genes after duplicate merge", "genes_after_duplicate_merge"),
+        ("Genes used after zero filtering", "genes_used_after_zero_filtering"),
+        ("Removed all-zero genes", "all_zero_genes"),
+        ("Samples", "samples"),
+        ("R version", "r_version"),
+        ("DESeq2 version", "deseq2_version"),
+        ("edgeR version", "edger_version"),
+        ("Timestamp", "timestamp"),
+        ("Rounding applied", "rounding_applied"),
+        ("Max deviation from integer", "max_deviation_from_integer"),
+        ("Non-integer value fraction", "non_integer_value_fraction"),
+    ]
+    for label, key in report_fields:
+        render_info_line(label, report.get(key, "Not available"))
+    with st.expander("View normalization report JSON"):
+        st.json(report)
+
+
+def render_normalization_tab() -> None:
+    """Render the normalization workflow and output matrix viewer."""
+    st.subheader("Normalization")
+    st.write("Normalization uses the processed raw count matrix after gene-symbol conversion and duplicate-gene merging.")
+    if np is None:
+        st.error("NumPy is required for normalization input checks. Install with: pip install numpy")
+        return
+
+    processed_counts_df = st.session_state.get("processed_counts_df")
+    sample_columns = st.session_state.get("sample_columns", [])
+    if processed_counts_df is None:
+        st.info("Please upload and process a count matrix first.")
+        return
+
+    validation = validate_normalization_input(processed_counts_df, sample_columns)
+    summary = validation["summary"]
+    st.markdown("### Matrix summary")
+    render_info_line("Number of genes", f"{summary.get('genes', 0):,}")
+    render_info_line("Number of samples", f"{summary.get('samples', 0):,}")
+    render_info_line("Duplicated gene IDs count", f"{summary.get('duplicated_gene_ids', 0):,}")
+    render_info_line("All-zero genes count", f"{summary.get('all_zero_genes', 0):,}")
+    render_info_line("Non-integer value fraction", f"{summary.get('non_integer_value_fraction', 0):.6g}")
+    render_info_line("Max deviation from integer", f"{summary.get('max_deviation_from_integer', 0):.6g}")
+    st.markdown("### Total counts per sample")
+    st.dataframe(validation["total_counts_df"], use_container_width=True, hide_index=True)
+    for warning in validation["warnings"]:
+        st.warning(warning)
+    for error in validation["errors"]:
+        st.error(error)
+
+    if st.button("Run normalization", disabled=not validation["valid"], type="primary"):
+        with st.spinner("Running DESeq2 and edgeR normalization..."):
+            run_normalization_workflow()
+        if st.session_state.get("normalization_run_status", {}).get("success"):
+            st.success("Normalization completed.")
+        else:
+            st.error("Normalization failed.")
+
+    run_status = st.session_state.get("normalization_run_status")
+    if run_status and not run_status.get("success"):
+        st.error(run_status.get("stderr", "Normalization failed."))
+        with st.expander("Rscript stderr/stdout"):
+            st.code(run_status.get("stderr", ""), language="text")
+            if run_status.get("stdout"):
+                st.code(run_status.get("stdout", ""), language="text")
+
+    results = st.session_state.get("normalization_results")
+    if not results:
+        return
+
+    output_dir = Path(results["output_dir"])
+    st.markdown("### Results summary")
+    render_info_line("Output directory", output_dir)
+    dimensions = results.get("dimensions", pd.DataFrame())
+    if isinstance(dimensions, pd.DataFrame) and not dimensions.empty:
+        st.dataframe(dimensions, use_container_width=True, hide_index=True)
+    for label, table in results.get("factor_tables", {}).items():
+        st.markdown(f"### {label}")
+        st.dataframe(table, use_container_width=True, hide_index=True)
+    render_normalization_report(st.session_state.get("normalization_report"))
+
+    selected_label = st.selectbox(
+        "Normalized matrix",
+        list(NORMALIZATION_OUTPUTS.keys()),
+        index=list(NORMALIZATION_OUTPUTS.keys()).index(st.session_state.get("normalization_selected_matrix", "Raw counts")),
+        key="normalization_selected_matrix",
+    )
+    table_df = load_normalization_table(output_dir, selected_label)
+    render_matrix_table_viewer(
+        table_df,
+        selected_label,
+        NORMALIZATION_OUTPUTS[selected_label],
+        f"normalization_{re.sub(r'[^a-zA-Z0-9]+', '_', selected_label).strip('_').lower()}",
+    )
+
+
 def render_quality_control_tab() -> None:
     """Render Quality Control summaries, grouping, and bar plots."""
     st.subheader("Quality Control")
@@ -1836,11 +2347,13 @@ def main() -> None:
 
     render_sidebar()
 
-    upload_tab, qc_tab = st.tabs(["Upload Count Matrix", "Quality Control"])
+    upload_tab, qc_tab, norm_tab = st.tabs(["Upload Count Matrix", "Quality Control", "Normalization"])
     with upload_tab:
         render_upload_count_matrix_tab()
     with qc_tab:
         render_quality_control_tab()
+    with norm_tab:
+        render_normalization_tab()
 
 
 if __name__ == "__main__":
