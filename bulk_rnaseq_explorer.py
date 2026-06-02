@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_12
+Version: bulk_rnaseq_explorer_v1_13
 
-Scope for v1.12:
+Scope for v1.13:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -12,6 +12,7 @@ Scope for v1.12:
 - Use placeholder-based QC grouping inputs and nonce-based QC plot widgets.
 - Polish Quality Control button responsiveness and barplot axis label controls.
 - Tighten Quality Control action-button rows on wide and narrow screens.
+- Use adaptive QC button widths without truncating labels.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -45,7 +46,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_12"
+APP_VERSION = "bulk_rnaseq_explorer_v1_13"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -1430,7 +1431,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             st.session_state[name_key] = group["name"]
             st.session_state[samples_key] = [sample for sample in group.get("samples", []) if sample in options]
 
-            cols = st.columns([2.0, 5.0, 1.35])
+            cols = st.columns([2.0, 4.8, 1.55])
             with cols[0]:
                 st.text_input(
                     "Group name",
@@ -1458,13 +1459,12 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     help="Remove this group",
                 )
 
-        action_cols = st.columns([0.95, 1.15, 4.8, 0.9])
+        action_cols = st.columns([1.35, 1.55, 3.4, 1.05])
         with action_cols[0]:
             save_grouping = st.button(
                 "Save QC grouping",
                 key="qc_group_save_button",
                 type="primary",
-                use_container_width=True,
             )
         with action_cols[1]:
             st.button(
@@ -1472,7 +1472,6 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                 key="qc_group_clear_button",
                 on_click=clear_qc_group_editor,
                 args=(sample_columns,),
-                use_container_width=True,
             )
         with action_cols[3]:
             st.button(
@@ -1480,7 +1479,6 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                 key="qc_group_add_button",
                 on_click=add_qc_group_to_editor,
                 args=(sample_columns,),
-                use_container_width=True,
             )
 
     if save_grouping:
@@ -1559,7 +1557,7 @@ def render_qc_barplot_section(
         st.session_state.pop(f"{plot_id}_aggregation", None)
     nonce = st.session_state.setdefault("qc_plot_reset_nonce", {}).setdefault(plot_id, 0)
 
-    control_cols = st.columns([1.15, 1.45, 0.9, 0.55, 0.55, 0.55, 3.2])
+    control_cols = st.columns([1.35, 1.75, 1.05, 0.8, 0.65, 0.65, 1.75])
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1598,7 +1596,7 @@ def render_qc_barplot_section(
         )
     with control_cols[3]:
         st.write("")
-        if st.button("Reset", key=f"{plot_id}_reset", use_container_width=True):
+        if st.button("Reset", key=f"{plot_id}_reset"):
             reset_qc_plot_setting(plot_id)
 
     with st.expander("Advanced settings"):
@@ -1727,7 +1725,6 @@ def render_qc_export_buttons(
             disabled=png_bytes is None,
             key=f"{plot_id}*download*png*{filename_base}*{nonce}",
             help="Download PNG",
-            use_container_width=True,
         )
     with svg_column:
         st.write("")
@@ -1739,7 +1736,6 @@ def render_qc_export_buttons(
             disabled=svg_bytes is None,
             key=f"{plot_id}*download*svg*{filename_base}*{nonce}",
             help="Download SVG",
-            use_container_width=True,
         )
     if png_bytes is None or svg_bytes is None:
         st.warning("Static image export requires kaleido. Install with: pip install kaleido")
@@ -1796,15 +1792,16 @@ def main() -> None:
             white-space: nowrap;
             text-align: center;
             justify-content: center;
-            display: flex;
+            display: inline-flex;
             align-items: center;
-            width: 100%;
-            max-width: 100%;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            font-size: clamp(0.72rem, 0.85vw, 0.95rem);
-            padding-left: clamp(0.35rem, 0.7vw, 0.75rem);
-            padding-right: clamp(0.35rem, 0.7vw, 0.75rem);
+            width: auto;
+            min-width: fit-content;
+            max-width: none;
+            overflow: visible;
+            text-overflow: clip;
+            font-size: clamp(0.82rem, 0.78vw, 0.95rem);
+            padding-left: 0.85rem;
+            padding-right: 0.85rem;
         }
 
         div[data-testid="stButton"] button p,
@@ -1812,8 +1809,8 @@ def main() -> None:
         div[data-testid="stButton"] button span,
         div[data-testid="stDownloadButton"] button span {
             white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            overflow: visible;
+            text-overflow: clip;
             margin: 0;
         }
         </style>
