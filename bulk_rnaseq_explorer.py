@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v1_14
+Version: bulk_rnaseq_explorer_v1_15
 
-Scope for v1.14:
+Scope for v1.15:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -14,6 +14,7 @@ Scope for v1.14:
 - Tighten Quality Control action-button rows on wide and narrow screens.
 - Use adaptive QC button widths without truncating labels.
 - Refactor Quality Control action rows into compact responsive clusters.
+- Align Quality Control buttons to their related input grids with small gaps.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -47,7 +48,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v1_14"
+APP_VERSION = "bulk_rnaseq_explorer_v1_15"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -1127,10 +1128,9 @@ def render_info_line(label: str, value: Any) -> None:
     st.write(f"{label}: `{value}`")
 
 
-def render_spacer_lines(n: int = 1) -> None:
-    """Add vertical spacing above compact controls that align with labeled inputs."""
-    for _ in range(n):
-        st.write("")
+def align_button_with_input() -> None:
+    """Align a button with neighboring labeled input widgets."""
+    st.markdown("<div style='height: 1.75rem;'></div>", unsafe_allow_html=True)
 
 
 def render_sidebar() -> None:
@@ -1438,8 +1438,8 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             st.session_state[name_key] = group["name"]
             st.session_state[samples_key] = [sample for sample in group.get("samples", []) if sample in options]
 
-            cols = st.columns([2.0, 4.3, 1.9])
-            with cols[0]:
+            row_cols = st.columns([2.0, 4.8, 1.55], gap="small")
+            with row_cols[0]:
                 st.text_input(
                     "Group name",
                     key=name_key,
@@ -1447,7 +1447,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     on_change=update_qc_group_name_from_widget,
                     args=(group_id,),
                 )
-            with cols[1]:
+            with row_cols[1]:
                 st.multiselect(
                     "Samples",
                     options=options,
@@ -1455,8 +1455,8 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     on_change=update_qc_group_samples_from_widget,
                     args=(group_id,),
                 )
-            with cols[2]:
-                render_spacer_lines()
+            with row_cols[2]:
+                align_button_with_input()
                 st.button(
                     "Remove group",
                     key=f"qc_group_remove_{group_id}",
@@ -1466,23 +1466,21 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
                     help="Remove this group",
                 )
 
-        action_left_col, action_right_col = st.columns([5.0, 1.0])
-        with action_left_col:
-            save_col, clear_col, _ = st.columns([1.0, 1.25, 3.5])
-            with save_col:
-                save_grouping = st.button(
-                    "Save QC grouping",
-                    key="qc_group_save_button",
-                    type="primary",
-                )
-            with clear_col:
-                st.button(
-                    "Clear grouping info",
-                    key="qc_group_clear_button",
-                    on_click=clear_qc_group_editor,
-                    args=(sample_columns,),
-                )
-        with action_right_col:
+        action_cols = st.columns([2.0, 4.8, 1.55], gap="small")
+        with action_cols[0]:
+            save_grouping = st.button(
+                "Save QC grouping",
+                key="qc_group_save_button",
+                type="primary",
+            )
+        with action_cols[1]:
+            st.button(
+                "Clear grouping info",
+                key="qc_group_clear_button",
+                on_click=clear_qc_group_editor,
+                args=(sample_columns,),
+            )
+        with action_cols[2]:
             st.button(
                 "Add group",
                 key="qc_group_add_button",
@@ -1566,8 +1564,8 @@ def render_qc_barplot_section(
         st.session_state.pop(f"{plot_id}_aggregation", None)
     nonce = st.session_state.setdefault("qc_plot_reset_nonce", {}).setdefault(plot_id, 0)
 
-    input_cols = st.columns([1.35, 1.85, 1.1, 2.8])
-    with input_cols[0]:
+    control_cols = st.columns([1.45, 1.9, 1.15, 0.75, 0.55, 0.55, 2.2], gap="small")
+    with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
             ["Sample name", "QC assignment group"],
@@ -1576,7 +1574,7 @@ def render_qc_barplot_section(
         )
     plot_by_group = settings["plot_by"] == "QC assignment group"
     effective_group_mode = plot_by_group and bool(grouping_names)
-    with input_cols[1]:
+    with control_cols[1]:
         if effective_group_mode:
             selected_grouping = settings.get("grouping_set") if settings.get("grouping_set") in grouping_names else grouping_names[0]
             settings["grouping_set"] = st.selectbox(
@@ -1594,7 +1592,7 @@ def render_qc_barplot_section(
             )
             if not effective_group_mode:
                 settings["grouping_set"] = None
-    with input_cols[2]:
+    with control_cols[2]:
         aggregation_options = ["Mean", "Median"] if plot_id == "zero_fraction" else ["Mean", "Median", "Sum"]
         settings["aggregation"] = st.selectbox(
             "Aggregation",
@@ -1604,8 +1602,8 @@ def render_qc_barplot_section(
             key=f"{plot_id}*aggregation*{nonce}",
         )
 
-    action_cols = st.columns([0.75, 0.55, 0.55, 5.0])
-    with action_cols[0]:
+    with control_cols[3]:
+        align_button_with_input()
         if st.button("Reset", key=f"{plot_id}_reset"):
             reset_qc_plot_setting(plot_id)
 
@@ -1689,7 +1687,7 @@ def render_qc_barplot_section(
         ).encode("utf-8")
     ).hexdigest()[:8]
     filename_base = f"{plot_id}_{APP_VERSION}_{export_signature}"
-    render_qc_export_buttons(fig, plot_id, filename_base, action_cols[1], action_cols[2], nonce)
+    render_qc_export_buttons(fig, plot_id, filename_base, control_cols[4], control_cols[5], nonce)
     st.plotly_chart(fig, use_container_width=False, key=f"{plot_id}_plotly_chart")
 
 
@@ -1726,6 +1724,7 @@ def render_qc_export_buttons(
     png_bytes = get_plotly_export_bytes(fig, "png", png_key)
     svg_bytes = get_plotly_export_bytes(fig, "svg", svg_key)
     with png_column:
+        align_button_with_input()
         st.download_button(
             "PNG",
             data=png_bytes or b"",
@@ -1736,6 +1735,7 @@ def render_qc_export_buttons(
             help="Download PNG",
         )
     with svg_column:
+        align_button_with_input()
         st.download_button(
             "SVG",
             data=svg_bytes or b"",
@@ -1803,7 +1803,7 @@ def main() -> None:
             display: inline-flex !important;
             align-items: center !important;
             width: auto !important;
-            min-width: max-content !important;
+            min-width: fit-content !important;
             max-width: none !important;
             overflow: visible !important;
             text-overflow: clip !important;
@@ -1820,34 +1820,6 @@ def main() -> None:
             overflow: visible !important;
             text-overflow: clip !important;
             margin: 0 !important;
-        }
-
-        div[data-testid="column"] {
-            min-width: 0;
-            overflow: visible;
-        }
-
-        .compact-button-row {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            gap: 0.6rem;
-            width: 100%;
-        }
-
-        .compact-button-row-left {
-            justify-content: flex-start;
-        }
-
-        .compact-button-row-between {
-            justify-content: space-between;
-        }
-
-        .compact-button-cluster {
-            display: flex;
-            flex-wrap: wrap;
-            align-items: center;
-            gap: 0.6rem;
         }
         </style>
         """,
