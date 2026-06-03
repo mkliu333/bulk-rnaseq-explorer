@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v2_0
+Version: bulk_rnaseq_explorer_v2_1
 
-Scope for v2.0:
+Scope for v2.1:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -15,7 +15,9 @@ Scope for v2.0:
 - Use adaptive QC button widths without truncating labels.
 - Refactor Quality Control action rows into compact responsive clusters.
 - Align Quality Control buttons to their related input grids with small gaps.
-- Add a Normalization workflow driven by DESeq2 and edgeR through Rscript.
+- Automatically run Normalization when processed count input changes.
+- Keep QC barplot rendering fast by lazily preparing PNG/SVG export bytes.
+- Refine Normalized matrix search, pagination, and CSV controls.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -56,7 +58,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v2_0"
+APP_VERSION = "bulk_rnaseq_explorer_v2_1"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -147,6 +149,7 @@ def init_session_state() -> None:
         "normalization_table_page": 1,
         "normalization_table_rows_per_page": 25,
         "normalization_table_search": "",
+        "normalization_selected_gene": "",
         "gene_map_df": None,
         "gene_map_status": {
             "detected": False,
@@ -191,6 +194,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("normalization_table_page", 1)
     st.session_state.setdefault("normalization_table_rows_per_page", 25)
     st.session_state.setdefault("normalization_table_search", "")
+    st.session_state.setdefault("normalization_selected_gene", "")
 
 
 def default_conversion_summary() -> dict[str, Any]:
@@ -257,6 +261,7 @@ def clear_normalization_state() -> None:
     st.session_state["normalization_table_page"] = 1
     st.session_state["normalization_table_rows_per_page"] = 25
     st.session_state["normalization_table_search"] = ""
+    st.session_state["normalization_selected_gene"] = ""
 
 
 def read_count_matrix_file(uploaded_file) -> pd.DataFrame:
@@ -1624,7 +1629,7 @@ def render_qc_barplot_section(
         st.session_state.pop(f"{plot_id}_aggregation", None)
     nonce = st.session_state.setdefault("qc_plot_reset_nonce", {}).setdefault(plot_id, 0)
 
-    control_cols = st.columns([1.45, 1.9, 1.15, 0.75, 0.55, 0.55, 2.2], gap="small")
+    control_cols = st.columns([1.35, 1.75, 1.05, 0.72, 0.55, 0.55, 1.8], gap="small")
     with control_cols[0]:
         settings["plot_by"] = st.selectbox(
             "Plot by",
@@ -1747,18 +1752,19 @@ def render_qc_barplot_section(
         ).encode("utf-8")
     ).hexdigest()[:8]
     filename_base = f"{plot_id}_{APP_VERSION}_{export_signature}"
-    render_qc_export_buttons(fig, plot_id, filename_base, control_cols[4], control_cols[5], nonce)
+    render_qc_export_buttons(fig, plot_id, filename_base, export_signature, control_cols[4], control_cols[5], nonce)
     st.plotly_chart(fig, use_container_width=False, key=f"{plot_id}_plotly_chart")
 
 
-def get_plotly_export_bytes(fig: go.Figure, format: str, cache_key: str) -> bytes | None:
-    """Return cached Plotly static image bytes, generating them only for the current visual state."""
+def get_cached_plot_export_bytes(plot_id: str, export_signature: str, fig: go.Figure, fmt: str) -> bytes | None:
+    """Return cached Plotly static image bytes for one plot state."""
+    cache_key = f"{plot_id}:{export_signature}:{fmt}"
     export_cache = st.session_state.setdefault("qc_export_bytes", {})
     if cache_key in export_cache:
         return export_cache[cache_key]
     try:
-        kwargs: dict[str, Any] = {"format": format}
-        if format == "png":
+        kwargs: dict[str, Any] = {"format": fmt}
+        if fmt == "png":
             kwargs["scale"] = 3
         export_bytes = fig.to_image(**kwargs)
         if isinstance(export_bytes, str):
@@ -1766,7 +1772,6 @@ def get_plotly_export_bytes(fig: go.Figure, format: str, cache_key: str) -> byte
         export_cache[cache_key] = export_bytes
         return export_bytes
     except Exception:
-        export_cache[cache_key] = None
         return None
 
 
@@ -1774,39 +1779,38 @@ def render_qc_export_buttons(
     fig: go.Figure,
     plot_id: str,
     filename_base: str,
+    export_signature: str,
     png_column,
     svg_column,
     nonce: int,
 ) -> None:
-    """Render direct PNG/SVG download buttons for one QC plot."""
-    png_key = f"{plot_id}:{filename_base}:png"
-    svg_key = f"{plot_id}:{filename_base}:svg"
-    png_bytes = get_plotly_export_bytes(fig, "png", png_key)
-    svg_bytes = get_plotly_export_bytes(fig, "svg", svg_key)
-    with png_column:
-        align_button_with_input()
-        st.download_button(
-            "PNG",
-            data=png_bytes or b"",
-            file_name=f"{filename_base}.png",
-            mime="image/png",
-            disabled=png_bytes is None,
-            key=f"{plot_id}*download*png*{filename_base}*{nonce}",
-            help="Download PNG",
-        )
-    with svg_column:
-        align_button_with_input()
-        st.download_button(
-            "SVG",
-            data=svg_bytes or b"",
-            file_name=f"{filename_base}.svg",
-            mime="image/svg+xml",
-            disabled=svg_bytes is None,
-            key=f"{plot_id}*download*svg*{filename_base}*{nonce}",
-            help="Download SVG",
-        )
-    if png_bytes is None or svg_bytes is None:
-        st.warning("Static image export requires kaleido. Install with: pip install kaleido")
+    """Render lazy PNG/SVG export controls for one QC plot."""
+    export_cache = st.session_state.setdefault("qc_export_bytes", {})
+
+    def render_one_export(column, fmt: str, mime: str) -> None:
+        cache_key = f"{plot_id}:{export_signature}:{fmt}"
+        export_bytes = export_cache.get(cache_key)
+        with column:
+            align_button_with_input()
+            if export_bytes is None:
+                if st.button(fmt.upper(), key=f"{plot_id}*prepare*{fmt}*{filename_base}*{nonce}", help=f"Prepare {fmt.upper()} export"):
+                    export_bytes = get_cached_plot_export_bytes(plot_id, export_signature, fig, fmt)
+                    if export_bytes is None:
+                        st.warning("Static image export requires kaleido. Install with: pip install kaleido")
+                    else:
+                        st.rerun()
+                return
+            st.download_button(
+                fmt.upper(),
+                data=export_bytes,
+                file_name=f"{filename_base}.{fmt}",
+                mime=mime,
+                key=f"{plot_id}*download*{fmt}*{filename_base}*{nonce}",
+                help=f"Download {fmt.upper()}",
+            )
+
+    render_one_export(png_column, "png", "image/png")
+    render_one_export(svg_column, "svg", "image/svg+xml")
 
 
 def validate_normalization_input(counts_df: pd.DataFrame | None, sample_columns: list[str]) -> dict[str, Any]:
@@ -1816,7 +1820,6 @@ def validate_normalization_input(counts_df: pd.DataFrame | None, sample_columns:
         "errors": [],
         "warnings": [],
         "summary": {},
-        "total_counts_df": pd.DataFrame(columns=["Sample", "Total counts"]),
         "numeric_counts": None,
     }
     if counts_df is None or counts_df.empty:
@@ -1868,20 +1871,26 @@ def validate_normalization_input(counts_df: pd.DataFrame | None, sample_columns:
         "max_deviation_from_integer": max_deviation,
         "non_integer_value_fraction": non_integer_fraction,
     }
-    result["total_counts_df"] = pd.DataFrame(
-        {"Sample": list(total_counts.index), "Total counts": [float(value) for value in total_counts.values]}
-    )
     result["numeric_counts"] = numeric_counts
     return result
 
 
 def get_normalization_input_signature() -> str:
     """Return a signature for the current processed matrix and selected sample columns."""
+    processed_counts_df = st.session_state.get("processed_counts_df")
+    sample_columns = st.session_state.get("sample_columns", [])
+    processed_hash = None
+    if processed_counts_df is not None and "Gene" in processed_counts_df.columns and sample_columns:
+        signature_df = processed_counts_df[["Gene", *sample_columns]].copy()
+        processed_hash = hashlib.sha256(
+            pd.util.hash_pandas_object(signature_df, index=True).to_numpy().tobytes()
+        ).hexdigest()
     payload = {
         "counts": st.session_state.get("counts_file_signature"),
         "gene_id_column": st.session_state.get("gene_id_column"),
-        "samples": st.session_state.get("sample_columns", []),
-        "processed_shape": getattr(st.session_state.get("processed_counts_df"), "shape", None),
+        "samples": sample_columns,
+        "processed_shape": getattr(processed_counts_df, "shape", None),
+        "processed_hash": processed_hash,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -2001,34 +2010,11 @@ def load_normalization_table(output_dir: Path, label: str) -> pd.DataFrame:
     return cache[cache_key]
 
 
-def get_normalization_output_dimensions(output_dir: Path) -> pd.DataFrame:
-    """Return generated/missing status and dimensions for normalization matrix outputs."""
-    rows: list[dict[str, Any]] = []
-    for label, filename in NORMALIZATION_OUTPUTS.items():
-        path = output_dir / filename
-        if not path.exists():
-            rows.append({"Matrix": label, "File": filename, "Genes": None, "Samples": None, "Status": "Missing"})
-            continue
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, [])
-            genes = sum(1 for _ in reader)
-        rows.append(
-            {
-                "Matrix": label,
-                "File": filename,
-                "Genes": genes,
-                "Samples": max(len(header) - 1, 0),
-                "Status": "Generated",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def run_normalization_workflow() -> None:
     """Prepare input, run R normalization, and store output metadata in session state."""
     processed_counts_df = st.session_state.get("processed_counts_df")
     sample_columns = st.session_state.get("sample_columns", [])
+    input_signature = get_normalization_input_signature()
     validation = validate_normalization_input(processed_counts_df, sample_columns)
     if not validation["valid"]:
         st.session_state["normalization_run_status"] = {
@@ -2038,18 +2024,25 @@ def run_normalization_workflow() -> None:
             "returncode": None,
             "command": [],
         }
+        st.session_state["normalization_input_signature"] = input_signature
         return
 
     output_dir = create_normalization_output_dir()
     input_path = prepare_normalization_input(processed_counts_df, sample_columns, output_dir)
+    st.session_state["normalization_run_status"] = {
+        "success": None,
+        "stderr": "",
+        "stdout": "",
+        "returncode": None,
+        "command": [],
+    }
     run_status = run_r_normalization(input_path, output_dir)
     st.session_state["normalization_run_status"] = run_status
     st.session_state["normalization_output_dir"] = str(output_dir)
-    st.session_state["normalization_input_signature"] = get_normalization_input_signature()
+    st.session_state["normalization_input_signature"] = input_signature
     st.session_state["normalization_tables"] = {}
     if run_status["success"]:
         report = load_normalization_report(output_dir)
-        dimensions = get_normalization_output_dimensions(output_dir)
         factor_tables = {}
         for label, filename in NORMALIZATION_FACTOR_FILES.items():
             path = output_dir / filename
@@ -2057,7 +2050,6 @@ def run_normalization_workflow() -> None:
         st.session_state["normalization_report"] = report
         st.session_state["normalization_results"] = {
             "output_dir": str(output_dir),
-            "dimensions": dimensions,
             "factor_tables": factor_tables,
         }
         st.session_state["normalization_selected_matrix"] = "Raw counts"
@@ -2077,23 +2069,33 @@ def render_matrix_table_viewer(
     if table_df.empty:
         st.warning(f"{table_name} is empty.")
         return
-    search_key = f"{key_prefix}_search"
-    rows_key = f"{key_prefix}_rows_per_page"
-    page_key = f"{key_prefix}_page"
+    if key_prefix == "normalization":
+        search_key = "normalization_table_search"
+        rows_key = "normalization_table_rows_per_page"
+        page_key = "normalization_table_page"
+        selected_gene_key = "normalization_selected_gene"
+    else:
+        search_key = f"{key_prefix}_search"
+        rows_key = f"{key_prefix}_rows_per_page"
+        page_key = f"{key_prefix}_page"
+        selected_gene_key = f"{key_prefix}_selected_gene"
     previous_search_key = f"{key_prefix}_previous_search"
     previous_rows_key = f"{key_prefix}_previous_rows"
+    previous_gene_key = f"{key_prefix}_previous_gene"
     st.session_state.setdefault(search_key, "")
     st.session_state.setdefault(rows_key, 25)
     st.session_state.setdefault(page_key, 1)
+    st.session_state.setdefault(selected_gene_key, "")
 
-    control_cols = st.columns([2.4, 1.0, 0.6, 0.6, 0.8, 2.0], gap="small")
-    with control_cols[0]:
+    top_cols = st.columns([2.2, 0.9, 1.7], gap="small")
+    with top_cols[0]:
         search_query = st.text_input(
             "Search genes",
             key=search_key,
             placeholder="Type at least 3 characters...",
         )
-    with control_cols[1]:
+        st.caption("Type at least 3 characters to search. Use the matched gene selector to lock one gene.")
+    with top_cols[1]:
         rows_per_page = st.selectbox(
             "Show rows",
             [10, 25, 50, 100, 250],
@@ -2101,26 +2103,50 @@ def render_matrix_table_viewer(
             key=rows_key,
         )
 
+    gene_series = table_df["Gene"].astype(str) if "Gene" in table_df.columns else pd.Series([], dtype=str)
+    search_text = search_query.strip()
+    search_active = len(search_text) >= 3
+    matched_gene_list: list[str] = []
+    if search_active:
+        mask = gene_series.str.contains(re.escape(search_text), case=False, na=False)
+        matched_df = table_df.loc[mask].copy()
+        matched_gene_list = matched_df["Gene"].astype(str).tolist() if "Gene" in matched_df.columns else []
+        suggestions = matched_gene_list[:25]
+        if suggestions:
+            st.caption("Matched genes: " + " / ".join(f"`{gene}`" for gene in suggestions))
+            if len(matched_gene_list) > 25:
+                st.caption(f"Showing first 25 of {len(matched_gene_list):,} matched genes.")
+        else:
+            st.caption("No matched genes found.")
+    else:
+        matched_df = table_df
+        st.session_state[selected_gene_key] = ""
+
+    selector_options = [""] + matched_gene_list[:200] if search_active and matched_gene_list else [""]
+    if st.session_state.get(selected_gene_key, "") not in selector_options:
+        st.session_state[selected_gene_key] = ""
+    with top_cols[2]:
+        selected_gene = st.selectbox(
+            "Jump to matched gene",
+            selector_options,
+            key=selected_gene_key,
+            disabled=not (search_active and matched_gene_list),
+        )
+
+    if selected_gene:
+        display_df = table_df.loc[gene_series == selected_gene].copy()
+    else:
+        display_df = matched_df
+
     if (
         st.session_state.get(previous_search_key) != search_query
         or st.session_state.get(previous_rows_key) != rows_per_page
+        or st.session_state.get(previous_gene_key) != selected_gene
     ):
         st.session_state[page_key] = 1
         st.session_state[previous_search_key] = search_query
         st.session_state[previous_rows_key] = rows_per_page
-
-    gene_series = table_df["Gene"].astype(str) if "Gene" in table_df.columns else pd.Series([], dtype=str)
-    search_active = len(search_query.strip()) >= 3
-    if search_active:
-        mask = gene_series.str.contains(re.escape(search_query.strip()), case=False, na=False)
-        display_df = table_df.loc[mask].copy()
-        suggestions = display_df["Gene"].astype(str).head(10).tolist() if "Gene" in display_df.columns else []
-        if suggestions:
-            st.caption("Suggestions: " + " / ".join(f"`{gene}`" for gene in suggestions))
-        else:
-            st.caption("No matched genes found.")
-    else:
-        display_df = table_df
+        st.session_state[previous_gene_key] = selected_gene
 
     total_rows = int(display_df.shape[0])
     rows_per_page = int(rows_per_page)
@@ -2132,22 +2158,22 @@ def render_matrix_table_viewer(
     page_df = display_df.iloc[start:end].copy()
 
     st.write(f"Matrix shape: `{table_df.shape[0]:,}` genes x `{max(table_df.shape[1] - 1, 0):,}` samples")
-    if search_active:
+    if selected_gene:
+        st.write(f"Showing selected gene: `{selected_gene}`")
+    elif search_active:
         st.write(f"Search matched `{total_rows:,}` genes")
     st.write(f"Showing rows `{start + 1 if total_rows else 0:,}`-`{end:,}` of `{total_rows:,}`")
 
-    with control_cols[2]:
-        align_button_with_input()
+    nav_cols = st.columns([0.7, 0.7, 0.6, 1.1, 3.0], gap="small")
+    with nav_cols[0]:
         if st.button("Previous", key=f"{key_prefix}_previous", disabled=page <= 1):
             st.session_state[page_key] = max(page - 1, 1)
             st.rerun()
-    with control_cols[3]:
-        align_button_with_input()
+    with nav_cols[1]:
         if st.button("Next", key=f"{key_prefix}_next", disabled=page >= total_pages):
             st.session_state[page_key] = min(page + 1, total_pages)
             st.rerun()
-    with control_cols[4]:
-        align_button_with_input()
+    with nav_cols[2]:
         st.download_button(
             "CSV",
             data=display_df.to_csv(index=False).encode("utf-8"),
@@ -2155,7 +2181,8 @@ def render_matrix_table_viewer(
             mime="text/csv",
             key=f"{key_prefix}_csv",
         )
-    st.caption(f"Page {page} of {total_pages}")
+    with nav_cols[3]:
+        st.write(f"Page {page} of {total_pages}")
     st.dataframe(page_df, use_container_width=True, hide_index=True)
 
 
@@ -2168,20 +2195,13 @@ def render_normalization_report(report: dict[str, Any] | None) -> None:
         ("Original genes", "original_genes"),
         ("Genes after duplicate merge", "genes_after_duplicate_merge"),
         ("Genes used after zero filtering", "genes_used_after_zero_filtering"),
-        ("Removed all-zero genes", "all_zero_genes"),
         ("Samples", "samples"),
         ("R version", "r_version"),
         ("DESeq2 version", "deseq2_version"),
         ("edgeR version", "edger_version"),
-        ("Timestamp", "timestamp"),
-        ("Rounding applied", "rounding_applied"),
-        ("Max deviation from integer", "max_deviation_from_integer"),
-        ("Non-integer value fraction", "non_integer_value_fraction"),
     ]
     for label, key in report_fields:
         render_info_line(label, report.get(key, "Not available"))
-    with st.expander("View normalization report JSON"):
-        st.json(report)
 
 
 def render_normalization_tab() -> None:
@@ -2204,59 +2224,86 @@ def render_normalization_tab() -> None:
     render_info_line("Number of genes", f"{summary.get('genes', 0):,}")
     render_info_line("Number of samples", f"{summary.get('samples', 0):,}")
     render_info_line("Duplicated gene IDs count", f"{summary.get('duplicated_gene_ids', 0):,}")
-    render_info_line("All-zero genes count", f"{summary.get('all_zero_genes', 0):,}")
-    render_info_line("Non-integer value fraction", f"{summary.get('non_integer_value_fraction', 0):.6g}")
-    render_info_line("Max deviation from integer", f"{summary.get('max_deviation_from_integer', 0):.6g}")
-    st.markdown("### Total counts per sample")
-    st.dataframe(validation["total_counts_df"], use_container_width=True, hide_index=True)
     for warning in validation["warnings"]:
         st.warning(warning)
     for error in validation["errors"]:
         st.error(error)
+    if not validation["valid"]:
+        return
 
-    if st.button("Run normalization", disabled=not validation["valid"], type="primary"):
-        with st.spinner("Running DESeq2 and edgeR normalization..."):
-            run_normalization_workflow()
-        if st.session_state.get("normalization_run_status", {}).get("success"):
-            st.success("Normalization completed.")
-        else:
-            st.error("Normalization failed.")
+    current_signature = get_normalization_input_signature()
+    stored_signature = st.session_state.get("normalization_input_signature")
+    if stored_signature and stored_signature != current_signature:
+        clear_normalization_state()
+        stored_signature = None
 
     run_status = st.session_state.get("normalization_run_status")
+    results = st.session_state.get("normalization_results")
+    has_current_results = bool(results) and st.session_state.get("normalization_input_signature") == current_signature
+    failed_current_input = (
+        isinstance(run_status, dict)
+        and run_status.get("success") is False
+        and st.session_state.get("normalization_input_signature") == current_signature
+    )
+
+    if not has_current_results and not failed_current_input:
+        with st.spinner("Running DESeq2 and edgeR normalization..."):
+            run_normalization_workflow()
+        run_status = st.session_state.get("normalization_run_status")
+        results = st.session_state.get("normalization_results")
+        has_current_results = bool(results) and st.session_state.get("normalization_input_signature") == current_signature
+        failed_current_input = (
+            isinstance(run_status, dict)
+            and run_status.get("success") is False
+            and st.session_state.get("normalization_input_signature") == current_signature
+        )
+
     if run_status and not run_status.get("success"):
         st.error(run_status.get("stderr", "Normalization failed."))
         with st.expander("Rscript stderr/stdout"):
             st.code(run_status.get("stderr", ""), language="text")
             if run_status.get("stdout"):
                 st.code(run_status.get("stdout", ""), language="text")
-
-    results = st.session_state.get("normalization_results")
-    if not results:
+        if failed_current_input and st.button("Retry normalization", type="primary"):
+            clear_normalization_state()
+            with st.spinner("Running DESeq2 and edgeR normalization..."):
+                run_normalization_workflow()
+            st.rerun()
         return
 
+    if not has_current_results:
+        return
+    st.success("Normalization completed.")
+
     output_dir = Path(results["output_dir"])
-    st.markdown("### Results summary")
-    render_info_line("Output directory", output_dir)
-    dimensions = results.get("dimensions", pd.DataFrame())
-    if isinstance(dimensions, pd.DataFrame) and not dimensions.empty:
-        st.dataframe(dimensions, use_container_width=True, hide_index=True)
     for label, table in results.get("factor_tables", {}).items():
         st.markdown(f"### {label}")
         st.dataframe(table, use_container_width=True, hide_index=True)
     render_normalization_report(st.session_state.get("normalization_report"))
 
+    st.subheader("Normalized matrix")
+    matrix_labels = list(NORMALIZATION_OUTPUTS.keys())
+    selected_matrix = st.session_state.get("normalization_selected_matrix", "Raw counts")
+    if selected_matrix not in matrix_labels:
+        selected_matrix = "Raw counts"
+        st.session_state["normalization_selected_matrix"] = selected_matrix
     selected_label = st.selectbox(
-        "Normalized matrix",
-        list(NORMALIZATION_OUTPUTS.keys()),
-        index=list(NORMALIZATION_OUTPUTS.keys()).index(st.session_state.get("normalization_selected_matrix", "Raw counts")),
+        "Matrix",
+        matrix_labels,
+        index=matrix_labels.index(selected_matrix),
         key="normalization_selected_matrix",
+        label_visibility="collapsed",
     )
-    table_df = load_normalization_table(output_dir, selected_label)
+    try:
+        table_df = load_normalization_table(output_dir, selected_label)
+    except FileNotFoundError:
+        st.error(f"{selected_label} output is missing.")
+        return
     render_matrix_table_viewer(
         table_df,
         selected_label,
         NORMALIZATION_OUTPUTS[selected_label],
-        f"normalization_{re.sub(r'[^a-zA-Z0-9]+', '_', selected_label).strip('_').lower()}",
+        "normalization",
     )
 
 
