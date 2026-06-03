@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v2_2
+Version: bulk_rnaseq_explorer_v2_3
 
-Scope for v2.2:
+Scope for v2.3:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -19,6 +19,8 @@ Scope for v2.2:
 - Keep QC barplot rendering fast by lazily preparing PNG/SVG export bytes.
 - Refine Normalized matrix search, pagination, and CSV controls.
 - Add PCA and Sample Correlation QC plots.
+- Require normalized expression matrices for PCA and Sample Correlation.
+- Refine Sample Correlation heatmap annotation layout.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -59,7 +61,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v2_2"
+APP_VERSION = "bulk_rnaseq_explorer_v2_3"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -140,7 +142,7 @@ def init_session_state() -> None:
         "qc_summary": None,
         "qc_summary_signature": None,
         "qc_plot_data_cache": {},
-        "qc_active_view": "QC Summary",
+        "qc_active_view": "QC Summary & Grouping",
         "qc_pca_settings": default_qc_pca_settings(),
         "qc_pca_reset_nonce": 0,
         "qc_pca_cache": {},
@@ -192,7 +194,9 @@ def init_session_state() -> None:
     st.session_state.setdefault("qc_summary", None)
     st.session_state.setdefault("qc_summary_signature", None)
     st.session_state.setdefault("qc_plot_data_cache", {})
-    st.session_state.setdefault("qc_active_view", "QC Summary")
+    st.session_state.setdefault("qc_active_view", "QC Summary & Grouping")
+    if st.session_state.get("qc_active_view") == "QC Summary":
+        st.session_state["qc_active_view"] = "QC Summary & Grouping"
     st.session_state.setdefault("qc_pca_settings", default_qc_pca_settings())
     st.session_state.setdefault("qc_pca_reset_nonce", 0)
     st.session_state.setdefault("qc_pca_cache", {})
@@ -2108,21 +2112,6 @@ def _align_expression_matrix(df: pd.DataFrame, sample_columns: list[str]) -> pd.
     return aligned
 
 
-def build_approximate_vst_matrix(processed_counts_df: pd.DataFrame, sample_columns: list[str]) -> pd.DataFrame:
-    """Compute log2(CPM + 1) fallback from processed raw counts."""
-    matrix = processed_counts_df[["Gene", *sample_columns]].copy()
-    numeric_counts = matrix[sample_columns].apply(pd.to_numeric, errors="coerce").fillna(0).clip(lower=0)
-    nonzero_mask = numeric_counts.sum(axis=1) > 0
-    matrix = matrix.loc[nonzero_mask, ["Gene"]].copy()
-    numeric_counts = numeric_counts.loc[nonzero_mask]
-    library_sizes = numeric_counts.sum(axis=0).replace(0, np.nan)
-    cpm = numeric_counts.div(library_sizes, axis=1).fillna(0) * 1_000_000
-    vst = np.log2(cpm + 1) if np is not None else cpm
-    for sample in sample_columns:
-        matrix[sample] = vst[sample].astype(float)
-    return matrix
-
-
 def get_available_expression_matrices() -> dict[str, dict[str, Any]]:
     """Return cached expression matrices available for PCA and sample correlation."""
     processed_counts_df = st.session_state.get("processed_counts_df")
@@ -2145,17 +2134,8 @@ def get_available_expression_matrices() -> dict[str, dict[str, Any]]:
         return cache.get("matrices", {})
 
     matrices: dict[str, dict[str, Any]] = {}
-    approximate_vst = build_approximate_vst_matrix(processed_counts_df, sample_columns)
-    aligned_approximate = _align_expression_matrix(approximate_vst, sample_columns)
-    if aligned_approximate is not None and not aligned_approximate.empty:
-        matrices["approximate VST"] = {
-            "df": aligned_approximate,
-            "signature": _matrix_signature(aligned_approximate, sample_columns),
-            "source": "processed raw counts",
-        }
-
     if output_dir and output_dir.exists():
-        for label in ["DESeq2 VST", "log2(CPM + 1)", "CPM", "edgeR TMM logCPM"]:
+        for label in ["DESeq2 VST", "log2(CPM + 1)", "edgeR TMM logCPM", "DESeq2 normalized counts"]:
             try:
                 matrix_df = load_normalization_table(output_dir, label)
             except Exception:
@@ -2168,7 +2148,7 @@ def get_available_expression_matrices() -> dict[str, dict[str, Any]]:
                     "source": "normalization output",
                 }
 
-    ordered_labels = ["DESeq2 VST", "approximate VST", "log2(CPM + 1)", "CPM", "edgeR TMM logCPM"]
+    ordered_labels = ["DESeq2 VST", "log2(CPM + 1)", "edgeR TMM logCPM", "DESeq2 normalized counts"]
     ordered_matrices = {label: matrices[label] for label in ordered_labels if label in matrices}
     cache["cache_key"] = cache_key
     cache["matrices"] = ordered_matrices
@@ -2448,6 +2428,8 @@ def make_sample_correlation_plot(
             z=corr,
             x=sample_columns,
             y=sample_columns,
+            xgap=1,
+            ygap=1,
             zmin=-1,
             zmax=1,
             colorscale=[[0, "#1f3b82"], [0.5, "#f8fafc"], [1, "#c62828"]],
@@ -2455,6 +2437,7 @@ def make_sample_correlation_plot(
                 title="Pearson r",
                 thickness=int(settings.get("colorbar_thickness", 16)),
                 len=float(settings.get("colorbar_length", 0.72)),
+                x=0.88,
             ),
             text=text,
             texttemplate="%{text}" if text else None,
@@ -2469,6 +2452,8 @@ def make_sample_correlation_plot(
                 z=[group_codes],
                 x=sample_columns,
                 y=["Group"],
+                xgap=1,
+                ygap=1,
                 zmin=0,
                 zmax=max(len(unique_groups) - 1, 1),
                 colorscale=_discrete_colorscale(group_colors),
@@ -2484,6 +2469,8 @@ def make_sample_correlation_plot(
                 z=[[code] for code in group_codes],
                 x=["Group"],
                 y=sample_columns,
+                xgap=1,
+                ygap=1,
                 zmin=0,
                 zmax=max(len(unique_groups) - 1, 1),
                 colorscale=_discrete_colorscale(group_colors),
@@ -2505,16 +2492,20 @@ def make_sample_correlation_plot(
                     showlegend=True,
                 )
             )
-    annotation_fraction = 0.08 if show_annotation else 0.0
-    main_start = annotation_fraction + 0.02 if show_annotation else 0.0
-    main_end = 0.86
+    annotation_fraction = 0.03 if show_annotation else 0.0
+    annotation_gap = 0.012 if show_annotation else 0.0
+    main_start = annotation_fraction + annotation_gap if show_annotation else 0.0
+    main_end = 0.84 if show_annotation else 0.86
+    main_y_end = 0.89 if show_annotation else 1.0
+    top_y_start = main_y_end + annotation_gap
+    top_y_end = min(top_y_start + annotation_fraction, 1.0)
     fig.update_layout(
         title="Sample Correlation",
         width=int(settings.get("plot_size", 860)),
         height=int(settings.get("plot_size", 860)),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=90, r=95, t=80, b=100),
+        margin=dict(l=120, r=145, t=80, b=105),
         xaxis=dict(
             domain=[main_start, main_end],
             tickangle=int(settings.get("x_axis_angle", 45)),
@@ -2522,18 +2513,18 @@ def make_sample_correlation_plot(
             side="bottom",
         ),
         yaxis=dict(
-            domain=[0, 1 - annotation_fraction - 0.02] if show_annotation else [0, 1],
+            domain=[0, main_y_end] if show_annotation else [0, 1],
             autorange="reversed",
             tickfont=dict(size=int(settings.get("label_size", 12))),
         ),
         xaxis2=dict(domain=[0, annotation_fraction], showticklabels=False, showgrid=False, zeroline=False),
         yaxis2=dict(
-            domain=[1 - annotation_fraction, 1] if show_annotation else [1, 1],
+            domain=[top_y_start, top_y_end] if show_annotation else [1, 1],
             showticklabels=False,
             showgrid=False,
             zeroline=False,
         ),
-        legend=dict(title="Group Info" if show_annotation else None),
+        legend=dict(title="Group" if show_annotation else None, x=1.04, y=0.98),
         font=dict(size=13),
     )
     return fig, group_keys if show_annotation else [], unique_groups if show_annotation else []
@@ -2855,15 +2846,13 @@ def reset_qc_corr_settings() -> None:
 
 
 def _select_expression_matrix(settings: dict[str, Any], matrices: dict[str, dict[str, Any]], key: str) -> str | None:
-    """Render a matrix selector with DESeq2 VST preferred and approximate VST fallback."""
+    """Render a normalized expression matrix selector with DESeq2 VST preferred."""
     if not matrices:
         return None
     labels = list(matrices.keys())
     selected = settings.get("matrix", "DESeq2 VST")
     if selected not in labels:
-        selected = "DESeq2 VST" if "DESeq2 VST" in labels else "approximate VST"
-        if selected not in labels:
-            selected = labels[0]
+        selected = "DESeq2 VST" if "DESeq2 VST" in labels else labels[0]
         settings["matrix"] = selected
     selected = st.selectbox(
         "Matrix",
@@ -2884,7 +2873,7 @@ def render_qc_pca_section(sample_columns: list[str]) -> None:
         return
     matrices = get_available_expression_matrices()
     if not matrices:
-        st.warning("No expression matrix is available for PCA.")
+        st.warning("Please complete normalization first. DESeq2 VST is required for PCA and sample correlation.")
         return
     settings = st.session_state.setdefault("qc_pca_settings", default_qc_pca_settings())
     nonce = get_qc_reset_nonce("pca_plot")
@@ -3006,7 +2995,7 @@ def render_qc_sample_correlation_section(sample_columns: list[str]) -> None:
         return
     matrices = get_available_expression_matrices()
     if not matrices:
-        st.warning("No expression matrix is available for sample correlation.")
+        st.warning("Please complete normalization first. DESeq2 VST is required for PCA and sample correlation.")
         return
     settings = st.session_state.setdefault("qc_corr_settings", default_qc_corr_settings())
     nonce = get_qc_reset_nonce("sample_correlation")
@@ -3065,33 +3054,12 @@ def render_qc_sample_correlation_section(sample_columns: list[str]) -> None:
         st.warning("Please create and save a QC grouping set first.")
 
     with st.expander("Advanced settings"):
-        adv_cols = st.columns(6)
-        with adv_cols[0]:
-            settings["show_correlation_values"] = st.checkbox(
-                "Show correlation values",
-                value=bool(settings.get("show_correlation_values", False)),
-                key=f"sample_correlation*show_values*{nonce}",
-            )
-        with adv_cols[1]:
-            settings["show_group_annotation"] = st.checkbox(
-                "Show group annotation",
-                value=bool(settings.get("show_group_annotation", True)) and plot_by_group,
-                disabled=not plot_by_group,
-                key=f"sample_correlation*show_annotation*{nonce}",
-            )
-        with adv_cols[2]:
+        slider_cols = st.columns(4)
+        with slider_cols[0]:
             settings["plot_size"] = st.slider("Plot size", 640, 1200, int(settings.get("plot_size", 860)), 20, key=f"sample_correlation*plot_size*{nonce}")
-        with adv_cols[3]:
+        with slider_cols[1]:
             settings["label_size"] = st.slider("Label size", 9, 18, int(settings.get("label_size", 12)), 1, key=f"sample_correlation*label_size*{nonce}")
-        with adv_cols[4]:
-            angle_options = [0, 30, 45, 60, 90]
-            settings["x_axis_angle"] = st.selectbox(
-                "X-axis angle",
-                angle_options,
-                index=angle_options.index(int(settings.get("x_axis_angle", 45))),
-                key=f"sample_correlation*x_axis_angle*{nonce}",
-            )
-        with adv_cols[5]:
+        with slider_cols[2]:
             settings["colorbar_thickness"] = st.slider(
                 "Colorbar thickness",
                 8,
@@ -3100,6 +3068,7 @@ def render_qc_sample_correlation_section(sample_columns: list[str]) -> None:
                 1,
                 key=f"sample_correlation*colorbar_thickness*{nonce}",
             )
+        with slider_cols[3]:
             settings["colorbar_length"] = st.slider(
                 "Colorbar length",
                 0.45,
@@ -3107,6 +3076,28 @@ def render_qc_sample_correlation_section(sample_columns: list[str]) -> None:
                 float(settings.get("colorbar_length", 0.72)),
                 0.05,
                 key=f"sample_correlation*colorbar_length*{nonce}",
+            )
+        option_cols = st.columns(3)
+        with option_cols[0]:
+            settings["show_correlation_values"] = st.checkbox(
+                "Show correlation values",
+                value=bool(settings.get("show_correlation_values", False)),
+                key=f"sample_correlation*show_values*{nonce}",
+            )
+        with option_cols[1]:
+            settings["show_group_annotation"] = st.checkbox(
+                "Show group annotation",
+                value=bool(settings.get("show_group_annotation", True)) and plot_by_group,
+                disabled=not plot_by_group,
+                key=f"sample_correlation*show_annotation*{nonce}",
+            )
+        with option_cols[2]:
+            angle_options = [0, 30, 45, 60, 90]
+            settings["x_axis_angle"] = st.selectbox(
+                "X-axis angle",
+                angle_options,
+                index=angle_options.index(int(settings.get("x_axis_angle", 45))),
+                key=f"sample_correlation*x_axis_angle*{nonce}",
             )
 
     corr_result = compute_cached_sample_correlation(
@@ -3177,25 +3168,27 @@ def render_quality_control_tab() -> None:
     sample_qc_df = qc_summary["sample_qc_df"]
 
     qc_views = [
-        "QC Summary",
+        "QC Summary & Grouping",
         "Library Size",
         "Detected Genes",
         "Zero-count Fraction",
         "PCA",
         "Sample Correlation",
     ]
+    stored_qc_view = st.session_state.get("qc_active_view", "QC Summary & Grouping")
+    if stored_qc_view == "QC Summary":
+        stored_qc_view = "QC Summary & Grouping"
+        st.session_state["qc_active_view"] = stored_qc_view
     active_view = st.radio(
         "QC view",
         qc_views,
-        index=qc_views.index(st.session_state.get("qc_active_view", "QC Summary"))
-        if st.session_state.get("qc_active_view", "QC Summary") in qc_views
-        else 0,
+        index=qc_views.index(stored_qc_view) if stored_qc_view in qc_views else 0,
         horizontal=True,
         key="qc_active_view",
         label_visibility="collapsed",
     )
 
-    if active_view == "QC Summary":
+    if active_view == "QC Summary & Grouping":
         st.markdown("### Dataset summary")
         display_sample_qc = sample_qc_df.copy()
         display_sample_qc["Library size"] = display_sample_qc["Library size"].round(0).astype("int64")
