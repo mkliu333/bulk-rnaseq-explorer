@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v2_3
+Version: bulk_rnaseq_explorer_v2_4
 
-Scope for v2.3:
+Scope for v2.4:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -21,6 +21,7 @@ Scope for v2.3:
 - Add PCA and Sample Correlation QC plots.
 - Require normalized expression matrices for PCA and Sample Correlation.
 - Refine Sample Correlation heatmap annotation layout.
+- Preserve saved QC grouping names and order in PCA and Sample Correlation.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -61,7 +62,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v2_3"
+APP_VERSION = "bulk_rnaseq_explorer_v2_4"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -138,6 +139,7 @@ def init_session_state() -> None:
         "qc_group_id_counter": 2,
         "qc_plot_settings": default_qc_plot_settings(),
         "qc_plot_reset_nonce": {},
+        "qc_group_colors": {},
         "qc_export_bytes": {},
         "qc_summary": None,
         "qc_summary_signature": None,
@@ -190,6 +192,7 @@ def init_session_state() -> None:
     plot_reset_nonce = st.session_state.setdefault("qc_plot_reset_nonce", {})
     for plot_id in QC_PLOT_DEFINITIONS:
         plot_reset_nonce.setdefault(plot_id, 0)
+    st.session_state.setdefault("qc_group_colors", {})
     st.session_state.setdefault("qc_export_bytes", {})
     st.session_state.setdefault("qc_summary", None)
     st.session_state.setdefault("qc_summary_signature", None)
@@ -251,6 +254,7 @@ def clear_count_matrix_state() -> None:
     st.session_state["qc_group_id_counter"] = 2
     st.session_state["qc_plot_settings"] = default_qc_plot_settings()
     st.session_state["qc_plot_reset_nonce"] = {plot_id: 0 for plot_id in QC_PLOT_DEFINITIONS}
+    st.session_state["qc_group_colors"] = {}
     st.session_state["qc_export_bytes"] = {}
     st.session_state["qc_summary"] = None
     st.session_state["qc_summary_signature"] = None
@@ -935,6 +939,43 @@ def get_editor_groups_as_dict(groups_or_editor: Any) -> dict[str, list[str]]:
     return {}
 
 
+def build_fresh_qc_group_editor_from_widgets(sample_columns: list[str]) -> dict[str, Any]:
+    """Build a grouping editor snapshot from current widget values before saving."""
+    editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
+    fresh_groups: list[dict[str, Any]] = []
+    for group in editor["groups"]:
+        group_id = group["id"]
+        name_key = f"qc_group_name_input_{group_id}"
+        samples_key = f"qc_group_samples_input_{group_id}"
+        current_name = str(st.session_state.get(name_key, group.get("name", ""))).strip()
+        raw_samples = st.session_state.get(samples_key, group.get("samples", []))
+        current_samples = [
+            str(sample) for sample in raw_samples
+            if str(sample) in sample_columns
+        ] if isinstance(raw_samples, list) else []
+        fresh_groups.append({"id": group_id, "name": current_name, "samples": current_samples})
+    fresh_editor = {
+        "grouping_set_name": str(st.session_state.get("qc_grouping_set_name_input", editor.get("grouping_set_name", ""))).strip(),
+        "groups": fresh_groups,
+    }
+    return normalize_qc_group_editor(fresh_editor, sample_columns)
+
+
+def get_grouping_dict(grouping_name: str | None) -> dict[str, list[str]]:
+    """Return one saved grouping dict by name."""
+    grouping_sets = st.session_state.get("qc_grouping_sets", {})
+    grouping = grouping_sets.get(grouping_name or "")
+    return grouping if isinstance(grouping, dict) else {}
+
+
+def get_ordered_group_names(grouping_name: str | None, include_unassigned: bool = False) -> list[str]:
+    """Return saved group names in user-defined order, with Unassigned last if requested."""
+    group_names = list(get_grouping_dict(grouping_name).keys())
+    if include_unassigned and "Unassigned" not in group_names:
+        group_names.append("Unassigned")
+    return group_names
+
+
 def get_unassigned_samples(groups_or_editor: Any, sample_columns: list[str]) -> list[str]:
     """Return samples not assigned to any QC group."""
     groups = get_editor_groups_as_dict(groups_or_editor)
@@ -1098,6 +1139,11 @@ def clear_qc_group_editor(sample_columns: list[str]) -> None:
 
 def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
     """Get a stable color for one sample or group in one plot."""
+    if entity_key.startswith("group:"):
+        group_colors = st.session_state.setdefault("qc_group_colors", {})
+        if entity_key not in group_colors:
+            group_colors[entity_key] = "#9CA3AF" if entity_key == "group:Unassigned" else DEFAULT_QC_COLORS[index % len(DEFAULT_QC_COLORS)]
+        return group_colors[entity_key]
     settings = get_qc_visual_settings(plot_id)
     colors = settings.setdefault("colors", {})
     if entity_key not in colors:
@@ -1107,6 +1153,9 @@ def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
 
 def set_qc_color(plot_id: str, entity_key: str, color: str) -> None:
     """Store a custom QC color."""
+    if entity_key.startswith("group:"):
+        st.session_state.setdefault("qc_group_colors", {})[entity_key] = color
+        return
     settings = get_qc_visual_settings(plot_id)
     settings.setdefault("colors", {})[entity_key] = color
 
@@ -1545,10 +1594,6 @@ def make_qc_bar_plot(
     return fig
 
 
-# Streamlit reruns the script on widget changes. v1.8 minimizes expensive
-# recomputation and uses immediate session-state guards, but true instant
-# drag/drop or fully local UI updates would require a custom Streamlit
-# component or a React frontend.
 def render_qc_group_editor_form(sample_columns: list[str]) -> None:
     """Render the immediate-update QC grouping draft editor."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
@@ -1636,12 +1681,8 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             )
 
     if save_grouping:
-        update_qc_grouping_name_from_widget()
-        current_editor = normalize_qc_group_editor(st.session_state["current_qc_group_editor"], sample_columns)
-        for group in current_editor["groups"]:
-            update_qc_group_name_from_widget(group["id"])
-            update_qc_group_samples_from_widget(group["id"])
-        current_editor = normalize_qc_group_editor(st.session_state["current_qc_group_editor"], sample_columns)
+        current_editor = build_fresh_qc_group_editor_from_widgets(sample_columns)
+        st.session_state["current_qc_group_editor"] = current_editor
         errors = validate_qc_grouping(current_editor, sample_columns)
         if errors:
             for error in errors:
@@ -2186,7 +2227,7 @@ def parse_top_variable_gene_limit(value: str) -> int | None:
 def get_sample_group_assignments(grouping_name: str | None, sample_columns: list[str]) -> dict[str, str]:
     """Map samples to saved QC groups, using Unassigned for missing samples."""
     assignments = {sample: "Unassigned" for sample in sample_columns}
-    grouping_dict = st.session_state.get("qc_grouping_sets", {}).get(grouping_name or "")
+    grouping_dict = get_grouping_dict(grouping_name)
     if not grouping_dict:
         return assignments
     for group_name, samples in grouping_dict.items():
@@ -2318,14 +2359,17 @@ def make_qc_pca_plot(
     explained = pca_result["explained_variance"]
     plot_by_group = settings.get("plot_by") == "QC assignment group"
     groups = get_group_labels_for_samples(grouping_name, sample_columns)
-    color_labels = groups if plot_by_group else sample_columns
+    if plot_by_group:
+        ordered_groups = [
+            group for group in get_ordered_group_names(grouping_name, include_unassigned=True)
+            if group in set(groups)
+        ]
+        unique_labels = ordered_groups
+        unique_keys = [get_qc_group_color_key(group) for group in ordered_groups]
+    else:
+        unique_labels = sample_columns
+        unique_keys = [f"sample:{sample}" for sample in sample_columns]
     color_keys = [get_qc_group_color_key(group) if plot_by_group else f"sample:{sample}" for group, sample in zip(groups, sample_columns)]
-    unique_keys: list[str] = []
-    unique_labels: list[str] = []
-    for key, label in zip(color_keys, color_labels):
-        if key not in unique_keys:
-            unique_keys.append(key)
-            unique_labels.append(label)
     color_map = {key: get_qc_color("pca_plot", key, index) for index, key in enumerate(unique_keys)}
 
     fig = go.Figure()
@@ -2412,16 +2456,19 @@ def make_sample_correlation_plot(
     plot_by_group = settings.get("plot_by") == "QC assignment group"
     show_annotation = bool(settings.get("show_group_annotation", True)) and plot_by_group
     groups = get_group_labels_for_samples(grouping_name, sample_columns)
-    unique_groups: list[str] = []
-    for group in groups:
-        if group not in unique_groups:
-            unique_groups.append(group)
+    unique_groups = (
+        [
+            group for group in get_ordered_group_names(grouping_name, include_unassigned=True)
+            if group in set(groups)
+        ]
+        if show_annotation
+        else []
+    )
     group_keys = [get_qc_group_color_key(group) for group in unique_groups]
     group_colors = [get_qc_color("sample_correlation", key, index) for index, key in enumerate(group_keys)]
     group_index = {group: index for index, group in enumerate(unique_groups)}
-    group_codes = [group_index[group] for group in groups]
+    group_codes = [group_index[group] for group in groups] if show_annotation else []
 
-    text = [[f"{value:.2f}" for value in row] for row in corr] if settings.get("show_correlation_values") else None
     fig = go.Figure()
     fig.add_trace(
         go.Heatmap(
@@ -2439,13 +2486,41 @@ def make_sample_correlation_plot(
                 len=float(settings.get("colorbar_length", 0.72)),
                 x=0.88,
             ),
-            text=text,
-            texttemplate="%{text}" if text else None,
             hovertemplate="Sample 1: %{y}<br>Sample 2: %{x}<br>Pearson r: %{z:.3f}<extra></extra>",
             xaxis="x",
             yaxis="y",
         )
     )
+    if settings.get("show_correlation_values"):
+        text_font_size = max(int(settings.get("label_size", 12)) - 2, 8)
+        for text_color, mask_fn in [
+            ("white", lambda value: value >= 0.9),
+            ("black", lambda value: value < 0.9),
+        ]:
+            x_values = []
+            y_values = []
+            labels = []
+            for row_index, sample_y in enumerate(sample_columns):
+                for col_index, sample_x in enumerate(sample_columns):
+                    value = float(corr[row_index, col_index])
+                    if mask_fn(value):
+                        x_values.append(sample_x)
+                        y_values.append(sample_y)
+                        labels.append(f"{value:.2f}")
+            if labels:
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_values,
+                        y=y_values,
+                        text=labels,
+                        mode="text",
+                        textfont=dict(color=text_color, size=text_font_size),
+                        hoverinfo="skip",
+                        showlegend=False,
+                        xaxis="x",
+                        yaxis="y",
+                    )
+                )
     if show_annotation and unique_groups:
         fig.add_trace(
             go.Heatmap(
@@ -2494,7 +2569,9 @@ def make_sample_correlation_plot(
             )
     annotation_fraction = 0.03 if show_annotation else 0.0
     annotation_gap = 0.012 if show_annotation else 0.0
-    main_start = annotation_fraction + annotation_gap if show_annotation else 0.0
+    main_start = 0.07 if show_annotation else 0.0
+    left_annotation_start = main_start - annotation_gap - annotation_fraction if show_annotation else 0.0
+    left_annotation_end = main_start - annotation_gap if show_annotation else 0.0
     main_end = 0.84 if show_annotation else 0.86
     main_y_end = 0.89 if show_annotation else 1.0
     top_y_start = main_y_end + annotation_gap
@@ -2505,7 +2582,7 @@ def make_sample_correlation_plot(
         height=int(settings.get("plot_size", 860)),
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=120, r=145, t=80, b=105),
+        margin=dict(l=165, r=145, t=80, b=105),
         xaxis=dict(
             domain=[main_start, main_end],
             tickangle=int(settings.get("x_axis_angle", 45)),
@@ -2517,7 +2594,7 @@ def make_sample_correlation_plot(
             autorange="reversed",
             tickfont=dict(size=int(settings.get("label_size", 12))),
         ),
-        xaxis2=dict(domain=[0, annotation_fraction], showticklabels=False, showgrid=False, zeroline=False),
+        xaxis2=dict(domain=[left_annotation_start, left_annotation_end], showticklabels=False, showgrid=False, zeroline=False),
         yaxis2=dict(
             domain=[top_y_start, top_y_end] if show_annotation else [1, 1],
             showticklabels=False,
