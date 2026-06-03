@@ -1,8 +1,8 @@
 """
 Bulk RNA-seq Explorer
-Version: bulk_rnaseq_explorer_v2_4
+Version: bulk_rnaseq_explorer_v2_5
 
-Scope for v2.4:
+Scope for v2.5:
 - Clean Streamlit product UI for count-matrix upload and sample grouping.
 - Detect whether the uploaded gene IDs are Ensembl IDs, gene symbols, mixed, or unclear.
 - Convert mouse Ensembl IDs to gene symbols when a local mapping can be parsed.
@@ -22,6 +22,8 @@ Scope for v2.4:
 - Require normalized expression matrices for PCA and Sample Correlation.
 - Refine Sample Correlation heatmap annotation layout.
 - Preserve saved QC grouping names and order in PCA and Sample Correlation.
+- Keep normalization outputs in memory after temporary Rscript exchange.
+- Stabilize QC grouping editor widget keys against browser autofill.
 
 To reduce Streamlit toolbar/menu visibility, users may create `.streamlit/config.toml` with:
 
@@ -47,7 +49,6 @@ import json
 import re
 import subprocess
 import tempfile
-from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-APP_VERSION = "bulk_rnaseq_explorer_v2_4"
+APP_VERSION = "bulk_rnaseq_explorer_v2_5"
 
 DEFAULT_QC_COLORS = [
     "#355070", "#6d597a", "#b56576", "#e56b6f",
@@ -137,6 +138,7 @@ def init_session_state() -> None:
             ],
         },
         "qc_group_id_counter": 2,
+        "qc_group_editor_nonce": 0,
         "qc_plot_settings": default_qc_plot_settings(),
         "qc_plot_reset_nonce": {},
         "qc_group_colors": {},
@@ -153,7 +155,6 @@ def init_session_state() -> None:
         "qc_corr_cache": {},
         "qc_expression_matrix_cache": {},
         "normalization_results": None,
-        "normalization_output_dir": None,
         "normalization_report": None,
         "normalization_tables": {},
         "normalization_run_status": None,
@@ -208,8 +209,8 @@ def init_session_state() -> None:
     st.session_state.setdefault("qc_corr_cache", {})
     st.session_state.setdefault("qc_expression_matrix_cache", {})
     st.session_state.setdefault("qc_group_id_counter", 2)
+    st.session_state.setdefault("qc_group_editor_nonce", 0)
     st.session_state.setdefault("normalization_results", None)
-    st.session_state.setdefault("normalization_output_dir", None)
     st.session_state.setdefault("normalization_report", None)
     st.session_state.setdefault("normalization_tables", {})
     st.session_state.setdefault("normalization_run_status", None)
@@ -252,6 +253,7 @@ def clear_count_matrix_state() -> None:
         ],
     }
     st.session_state["qc_group_id_counter"] = 2
+    st.session_state["qc_group_editor_nonce"] = int(st.session_state.get("qc_group_editor_nonce", 0)) + 1
     st.session_state["qc_plot_settings"] = default_qc_plot_settings()
     st.session_state["qc_plot_reset_nonce"] = {plot_id: 0 for plot_id in QC_PLOT_DEFINITIONS}
     st.session_state["qc_group_colors"] = {}
@@ -278,7 +280,7 @@ def reset_analysis_state() -> None:
 def clear_normalization_state() -> None:
     """Clear normalization outputs when the processed count matrix changes."""
     st.session_state["normalization_results"] = None
-    st.session_state["normalization_output_dir"] = None
+    st.session_state.pop("normalization_output_dir", None)
     st.session_state["normalization_report"] = None
     st.session_state["normalization_tables"] = {}
     st.session_state["normalization_run_status"] = None
@@ -296,6 +298,26 @@ def clear_qc_expression_analysis_cache() -> None:
     st.session_state["qc_expression_matrix_cache"] = {}
     st.session_state["qc_pca_cache"] = {}
     st.session_state["qc_corr_cache"] = {}
+
+
+def get_qc_group_editor_nonce() -> int:
+    """Return the active QC grouping editor nonce."""
+    return int(st.session_state.setdefault("qc_group_editor_nonce", 0))
+
+
+def qc_grouping_set_name_key() -> str:
+    """Return the active grouping-set name widget key."""
+    return f"qc_grouping_set_name_input_{get_qc_group_editor_nonce()}"
+
+
+def qc_group_name_key(group_id: str) -> str:
+    """Return the active group-name widget key for one group."""
+    return f"qc_group_name_input_{get_qc_group_editor_nonce()}_{group_id}"
+
+
+def qc_group_samples_key(group_id: str) -> str:
+    """Return the active group-samples widget key for one group."""
+    return f"qc_group_samples_input_{get_qc_group_editor_nonce()}_{group_id}"
 
 
 def read_count_matrix_file(uploaded_file) -> pd.DataFrame:
@@ -945,8 +967,8 @@ def build_fresh_qc_group_editor_from_widgets(sample_columns: list[str]) -> dict[
     fresh_groups: list[dict[str, Any]] = []
     for group in editor["groups"]:
         group_id = group["id"]
-        name_key = f"qc_group_name_input_{group_id}"
-        samples_key = f"qc_group_samples_input_{group_id}"
+        name_key = qc_group_name_key(group_id)
+        samples_key = qc_group_samples_key(group_id)
         current_name = str(st.session_state.get(name_key, group.get("name", ""))).strip()
         raw_samples = st.session_state.get(samples_key, group.get("samples", []))
         current_samples = [
@@ -955,7 +977,7 @@ def build_fresh_qc_group_editor_from_widgets(sample_columns: list[str]) -> dict[
         ] if isinstance(raw_samples, list) else []
         fresh_groups.append({"id": group_id, "name": current_name, "samples": current_samples})
     fresh_editor = {
-        "grouping_set_name": str(st.session_state.get("qc_grouping_set_name_input", editor.get("grouping_set_name", ""))).strip(),
+        "grouping_set_name": str(st.session_state.get(qc_grouping_set_name_key(), editor.get("grouping_set_name", ""))).strip(),
         "groups": fresh_groups,
     }
     return normalize_qc_group_editor(fresh_editor, sample_columns)
@@ -1074,21 +1096,27 @@ def _clear_qc_group_widget_keys(group_id: str | None = None) -> None:
     else:
         prefixes.extend([f"qc_group_name_input_{group_id}", f"qc_group_samples_input_{group_id}"])
     for key in list(st.session_state.keys()):
-        if any(str(key).startswith(prefix) for prefix in prefixes):
+        key_text = str(key)
+        group_suffix_match = (
+            group_id is not None
+            and (key_text.startswith("qc_group_name_input_") or key_text.startswith("qc_group_samples_input_"))
+            and key_text.endswith(f"_{group_id}")
+        )
+        if group_suffix_match or any(key_text.startswith(prefix) for prefix in prefixes):
             st.session_state.pop(key, None)
 
 
 def update_qc_grouping_name_from_widget() -> None:
     """Sync the grouping set name widget into the editor draft."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), st.session_state.get("sample_columns", []))
-    editor["grouping_set_name"] = st.session_state.get("qc_grouping_set_name_input", "")
+    editor["grouping_set_name"] = st.session_state.get(qc_grouping_set_name_key(), "")
     st.session_state["current_qc_group_editor"] = editor
 
 
 def update_qc_group_name_from_widget(group_id: str) -> None:
     """Sync one group name widget into the editor draft."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), st.session_state.get("sample_columns", []))
-    widget_key = f"qc_group_name_input_{group_id}"
+    widget_key = qc_group_name_key(group_id)
     for group in editor["groups"]:
         if group["id"] == group_id:
             group["name"] = str(st.session_state.get(widget_key, group["name"])).strip()
@@ -1100,7 +1128,7 @@ def update_qc_group_samples_from_widget(group_id: str) -> None:
     """Sync one sample multiselect widget into the editor draft."""
     sample_columns = st.session_state.get("sample_columns", [])
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
-    widget_key = f"qc_group_samples_input_{group_id}"
+    widget_key = qc_group_samples_key(group_id)
     selected_samples = [
         sample for sample in st.session_state.get(widget_key, [])
         if sample in sample_columns
@@ -1119,6 +1147,7 @@ def add_qc_group_to_editor(sample_columns: list[str]) -> None:
     group_id = f"group_{st.session_state['qc_group_id_counter']}"
     editor["groups"].append({"id": group_id, "name": "", "samples": []})
     st.session_state["current_qc_group_editor"] = editor
+    st.session_state["qc_group_editor_nonce"] = int(st.session_state.get("qc_group_editor_nonce", 0)) + 1
 
 
 def remove_qc_group_from_editor(group_id: str, sample_columns: list[str]) -> None:
@@ -1128,6 +1157,7 @@ def remove_qc_group_from_editor(group_id: str, sample_columns: list[str]) -> Non
         editor["groups"] = [group for group in editor["groups"] if group["id"] != group_id]
         _clear_qc_group_widget_keys(group_id)
     st.session_state["current_qc_group_editor"] = normalize_qc_group_editor(editor, sample_columns)
+    st.session_state["qc_group_editor_nonce"] = int(st.session_state.get("qc_group_editor_nonce", 0)) + 1
 
 
 def clear_qc_group_editor(sample_columns: list[str]) -> None:
@@ -1135,6 +1165,7 @@ def clear_qc_group_editor(sample_columns: list[str]) -> None:
     st.session_state["current_qc_group_editor"] = default_qc_group_editor(sample_columns)
     st.session_state["qc_group_id_counter"] = 2
     _clear_qc_group_widget_keys()
+    st.session_state["qc_group_editor_nonce"] = int(st.session_state.get("qc_group_editor_nonce", 0)) + 1
 
 
 def get_qc_color(plot_id: str, entity_key: str, index: int) -> str:
@@ -1597,11 +1628,12 @@ def make_qc_bar_plot(
 def render_qc_group_editor_form(sample_columns: list[str]) -> None:
     """Render the immediate-update QC grouping draft editor."""
     editor = normalize_qc_group_editor(st.session_state.get("current_qc_group_editor"), sample_columns)
-    if "qc_grouping_set_name_input" in st.session_state:
-        editor["grouping_set_name"] = st.session_state["qc_grouping_set_name_input"]
+    grouping_name_key = qc_grouping_set_name_key()
+    if grouping_name_key in st.session_state:
+        editor["grouping_set_name"] = st.session_state[grouping_name_key]
     for group in editor["groups"]:
-        name_key = f"qc_group_name_input_{group['id']}"
-        samples_key = f"qc_group_samples_input_{group['id']}"
+        name_key = qc_group_name_key(group["id"])
+        samples_key = qc_group_samples_key(group["id"])
         if name_key in st.session_state:
             group["name"] = str(st.session_state[name_key]).strip()
         if samples_key in st.session_state:
@@ -1613,19 +1645,19 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
     st.session_state["current_qc_group_editor"] = editor
 
     with st.container(border=True):
-        if "qc_grouping_set_name_input" not in st.session_state:
-            st.session_state["qc_grouping_set_name_input"] = editor["grouping_set_name"]
+        if grouping_name_key not in st.session_state:
+            st.session_state[grouping_name_key] = editor["grouping_set_name"]
         st.text_input(
-            "Grouping set name",
-            key="qc_grouping_set_name_input",
+            "QC grouping label",
+            key=grouping_name_key,
             placeholder="QC grouping 1",
             on_change=update_qc_grouping_name_from_widget,
         )
 
         for index, group in enumerate(editor["groups"], start=1):
             group_id = group["id"]
-            name_key = f"qc_group_name_input_{group_id}"
-            samples_key = f"qc_group_samples_input_{group_id}"
+            name_key = qc_group_name_key(group_id)
+            samples_key = qc_group_samples_key(group_id)
             options = get_available_samples_for_group(group_id, editor, sample_columns)
             st.session_state[name_key] = group["name"]
             st.session_state[samples_key] = [sample for sample in group.get("samples", []) if sample in options]
@@ -1633,7 +1665,7 @@ def render_qc_group_editor_form(sample_columns: list[str]) -> None:
             row_cols = st.columns([2.0, 4.8, 1.55], gap="small")
             with row_cols[0]:
                 st.text_input(
-                    "Group name",
+                    "QC group label",
                     key=name_key,
                     placeholder=f"Group {index}",
                     on_change=update_qc_group_name_from_widget,
@@ -2018,21 +2050,6 @@ def get_normalization_input_signature() -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
-def create_normalization_output_dir() -> Path:
-    """Create a unique output directory for one normalization run."""
-    base_dir = Path.cwd() / "outputs" / "normalization"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    signature = st.session_state.get("counts_file_signature")
-    if signature:
-        short_hash = str(signature)[:8]
-    else:
-        short_hash = hashlib.sha256(f"{timestamp}:{tempfile.gettempdir()}".encode("utf-8")).hexdigest()[:8]
-    output_dir = base_dir / f"{APP_VERSION}_{timestamp}_{short_hash}"
-    output_dir.mkdir(parents=True, exist_ok=False)
-    return output_dir
-
-
 def prepare_normalization_input(
     processed_counts_df: pd.DataFrame,
     sample_columns: list[str],
@@ -2123,14 +2140,34 @@ def load_normalization_report(output_dir: Path) -> dict[str, Any] | None:
     return json.loads(report_path.read_text(encoding="utf-8"))
 
 
-def load_normalization_table(output_dir: Path, label: str) -> pd.DataFrame:
-    """Load and cache one normalization matrix table by label."""
-    filename = NORMALIZATION_OUTPUTS[label]
-    cache_key = f"{output_dir.resolve()}:{filename}"
-    cache = st.session_state.setdefault("normalization_tables", {})
-    if cache_key not in cache:
-        cache[cache_key] = pd.read_csv(output_dir / filename)
-    return cache[cache_key]
+def load_all_normalization_outputs_from_dir(output_dir: Path) -> dict[str, pd.DataFrame]:
+    """Load all generated normalization matrices from a temporary output directory."""
+    tables: dict[str, pd.DataFrame] = {}
+    for label, filename in NORMALIZATION_OUTPUTS.items():
+        path = output_dir / filename
+        if path.exists():
+            tables[label] = pd.read_csv(path)
+    return tables
+
+
+def load_all_normalization_factor_tables_from_dir(output_dir: Path) -> dict[str, pd.DataFrame]:
+    """Load generated normalization factor tables from a temporary output directory."""
+    factor_tables: dict[str, pd.DataFrame] = {}
+    for label, filename in NORMALIZATION_FACTOR_FILES.items():
+        path = output_dir / filename
+        if path.exists():
+            factor_tables[label] = pd.read_csv(path)
+    return factor_tables
+
+
+def get_normalization_table(label: str) -> pd.DataFrame | None:
+    """Return one in-memory normalization table by label."""
+    results = st.session_state.get("normalization_results")
+    if not isinstance(results, dict):
+        return None
+    tables = results.get("tables", {})
+    table = tables.get(label) if isinstance(tables, dict) else None
+    return table.copy() if isinstance(table, pd.DataFrame) else None
 
 
 def _matrix_signature(df: pd.DataFrame, sample_columns: list[str]) -> str:
@@ -2160,14 +2197,15 @@ def get_available_expression_matrices() -> dict[str, dict[str, Any]]:
     if processed_counts_df is None or not sample_columns or np is None:
         return {}
     input_signature = get_normalization_input_signature()
-    output_dir = None
     results = st.session_state.get("normalization_results")
-    if results and st.session_state.get("normalization_input_signature") == input_signature:
-        output_dir_text = results.get("output_dir")
-        output_dir = Path(output_dir_text) if output_dir_text else None
+    tables = results.get("tables", {}) if isinstance(results, dict) and st.session_state.get("normalization_input_signature") == input_signature else {}
     cache_signature = {
         "input_signature": input_signature,
-        "output_dir": str(output_dir) if output_dir else None,
+        "tables": {
+            label: getattr(table, "shape", None)
+            for label, table in tables.items()
+            if isinstance(table, pd.DataFrame)
+        },
     }
     cache_key = hashlib.sha256(json.dumps(cache_signature, sort_keys=True).encode("utf-8")).hexdigest()
     cache = st.session_state.setdefault("qc_expression_matrix_cache", {})
@@ -2175,11 +2213,10 @@ def get_available_expression_matrices() -> dict[str, dict[str, Any]]:
         return cache.get("matrices", {})
 
     matrices: dict[str, dict[str, Any]] = {}
-    if output_dir and output_dir.exists():
+    if isinstance(tables, dict):
         for label in ["DESeq2 VST", "log2(CPM + 1)", "edgeR TMM logCPM", "DESeq2 normalized counts"]:
-            try:
-                matrix_df = load_normalization_table(output_dir, label)
-            except Exception:
+            matrix_df = tables.get(label)
+            if not isinstance(matrix_df, pd.DataFrame):
                 continue
             aligned = _align_expression_matrix(matrix_df, sample_columns)
             if aligned is not None and not aligned.empty:
@@ -2493,33 +2530,17 @@ def make_sample_correlation_plot(
     )
     if settings.get("show_correlation_values"):
         text_font_size = max(int(settings.get("label_size", 12)) - 2, 8)
-        for text_color, mask_fn in [
-            ("white", lambda value: value >= 0.9),
-            ("black", lambda value: value < 0.9),
-        ]:
-            x_values = []
-            y_values = []
-            labels = []
-            for row_index, sample_y in enumerate(sample_columns):
-                for col_index, sample_x in enumerate(sample_columns):
-                    value = float(corr[row_index, col_index])
-                    if mask_fn(value):
-                        x_values.append(sample_x)
-                        y_values.append(sample_y)
-                        labels.append(f"{value:.2f}")
-            if labels:
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_values,
-                        y=y_values,
-                        text=labels,
-                        mode="text",
-                        textfont=dict(color=text_color, size=text_font_size),
-                        hoverinfo="skip",
-                        showlegend=False,
-                        xaxis="x",
-                        yaxis="y",
-                    )
+        for row_index, sample_y in enumerate(sample_columns):
+            for col_index, sample_x in enumerate(sample_columns):
+                value = float(corr[row_index, col_index])
+                fig.add_annotation(
+                    x=sample_x,
+                    y=sample_y,
+                    xref="x",
+                    yref="y",
+                    text=f"{value:.2f}",
+                    showarrow=False,
+                    font=dict(color="white" if value >= 0.9 else "black", size=text_font_size),
                 )
     if show_annotation and unique_groups:
         fig.add_trace(
@@ -2567,13 +2588,14 @@ def make_sample_correlation_plot(
                     showlegend=True,
                 )
             )
-    annotation_fraction = 0.03 if show_annotation else 0.0
+    annotation_fraction = 0.025 if show_annotation else 0.0
     annotation_gap = 0.012 if show_annotation else 0.0
-    main_start = 0.07 if show_annotation else 0.0
+    main_start = 0.065 if show_annotation else 0.0
     left_annotation_start = main_start - annotation_gap - annotation_fraction if show_annotation else 0.0
     left_annotation_end = main_start - annotation_gap if show_annotation else 0.0
-    main_end = 0.84 if show_annotation else 0.86
-    main_y_end = 0.89 if show_annotation else 1.0
+    main_span = 0.74 if show_annotation else 0.80
+    main_end = main_start + main_span
+    main_y_end = main_span
     top_y_start = main_y_end + annotation_gap
     top_y_end = min(top_y_start + annotation_fraction, 1.0)
     fig.update_layout(
@@ -2585,18 +2607,31 @@ def make_sample_correlation_plot(
         margin=dict(l=165, r=145, t=80, b=105),
         xaxis=dict(
             domain=[main_start, main_end],
+            categoryorder="array",
+            categoryarray=sample_columns,
             tickangle=int(settings.get("x_axis_angle", 45)),
             tickfont=dict(size=int(settings.get("label_size", 12))),
             side="bottom",
         ),
         yaxis=dict(
-            domain=[0, main_y_end] if show_annotation else [0, 1],
+            domain=[0, main_y_end],
+            categoryorder="array",
+            categoryarray=sample_columns,
             autorange="reversed",
             tickfont=dict(size=int(settings.get("label_size", 12))),
         ),
-        xaxis2=dict(domain=[left_annotation_start, left_annotation_end], showticklabels=False, showgrid=False, zeroline=False),
+        xaxis2=dict(
+            domain=[left_annotation_start, left_annotation_end],
+            categoryorder="array",
+            categoryarray=["Group"],
+            showticklabels=False,
+            showgrid=False,
+            zeroline=False,
+        ),
         yaxis2=dict(
             domain=[top_y_start, top_y_end] if show_annotation else [1, 1],
+            categoryorder="array",
+            categoryarray=["Group"],
             showticklabels=False,
             showgrid=False,
             zeroline=False,
@@ -2624,8 +2659,6 @@ def run_normalization_workflow() -> None:
         st.session_state["normalization_input_signature"] = input_signature
         return
 
-    output_dir = create_normalization_output_dir()
-    input_path = prepare_normalization_input(processed_counts_df, sample_columns, output_dir)
     st.session_state["normalization_run_status"] = {
         "success": None,
         "stderr": "",
@@ -2633,22 +2666,23 @@ def run_normalization_workflow() -> None:
         "returncode": None,
         "command": [],
     }
-    run_status = run_r_normalization(input_path, output_dir)
+    with tempfile.TemporaryDirectory(prefix="bulk_rnaseq_normalization_") as temp_dir:
+        output_dir = Path(temp_dir)
+        input_path = prepare_normalization_input(processed_counts_df, sample_columns, output_dir)
+        run_status = run_r_normalization(input_path, output_dir)
+        report = load_normalization_report(output_dir) if run_status["success"] else None
+        tables = load_all_normalization_outputs_from_dir(output_dir) if run_status["success"] else {}
+        factor_tables = load_all_normalization_factor_tables_from_dir(output_dir) if run_status["success"] else {}
     st.session_state["normalization_run_status"] = run_status
-    st.session_state["normalization_output_dir"] = str(output_dir)
     st.session_state["normalization_input_signature"] = input_signature
-    st.session_state["normalization_tables"] = {}
+    st.session_state["normalization_tables"] = tables
     if run_status["success"]:
         clear_qc_expression_analysis_cache()
-        report = load_normalization_report(output_dir)
-        factor_tables = {}
-        for label, filename in NORMALIZATION_FACTOR_FILES.items():
-            path = output_dir / filename
-            factor_tables[label] = pd.read_csv(path) if path.exists() else pd.DataFrame()
         st.session_state["normalization_report"] = report
         st.session_state["normalization_results"] = {
-            "output_dir": str(output_dir),
+            "tables": tables,
             "factor_tables": factor_tables,
+            "report": report,
         }
         st.session_state["normalization_selected_matrix"] = "Raw counts"
         st.session_state["normalization_table_page"] = 1
@@ -2874,7 +2908,6 @@ def render_normalization_tab() -> None:
         return
     st.success("Normalization completed.")
 
-    output_dir = Path(results["output_dir"])
     for label, table in results.get("factor_tables", {}).items():
         st.markdown(f"### {label}")
         st.dataframe(table, use_container_width=True, hide_index=True)
@@ -2893,9 +2926,8 @@ def render_normalization_tab() -> None:
         key="normalization_selected_matrix",
         label_visibility="collapsed",
     )
-    try:
-        table_df = load_normalization_table(output_dir, selected_label)
-    except FileNotFoundError:
+    table_df = get_normalization_table(selected_label)
+    if table_df is None:
         st.error(f"{selected_label} output is missing.")
         return
     render_matrix_table_viewer(
