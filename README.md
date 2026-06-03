@@ -1,46 +1,36 @@
 # Bulk RNA-seq Explorer
 
-A Python/Streamlit-based MVP for interactive bulk RNA-seq count matrix exploration, gene identifier handling, quality control, sample grouping, and normalization.
+A Python/Streamlit-based software for interactive bulk RNA-seq count matrix exploration, quality control, sample grouping, normalization and DEG & Enriched pathway analysis.
 
-This project is currently in active prototype development. It was migrated from an earlier browser-only HTML prototype into a more reproducible Python/Streamlit architecture.
+This project was migrated from an earlier browser-only HTML prototype into a more reproducible Python/Streamlit + R/Bioconductor architecture.
 
 ## Current Status
 
-**Current app version:** `bulk_rnaseq_explorer_v2_0`
-
-**Current development stage:** Streamlit MVP / active internal prototype
+Current app version: `bulk_rnaseq_explorer_v2_5`
 
 The app currently supports:
 
-* Uploading a raw bulk RNA-seq count matrix.
-* Detecting sample columns from the uploaded matrix.
-* Detecting whether gene identifiers are mouse Ensembl IDs, gene symbols, mixed, or unclear.
-* Converting mouse Ensembl IDs to gene symbols using local mapping resources.
-* Merging duplicated processed gene symbols by summing raw counts.
-* Creating a processed raw count matrix for downstream analysis.
-* Computing sample-level quality control metrics.
-* Creating reusable QC grouping sets.
-* Generating configurable QC bar plots.
-* Exporting QC plots as PNG and true SVG through Plotly/Kaleido.
-* Running a first-pass normalization workflow through R/Bioconductor.
-* Previewing and exporting normalized matrices with search and pagination.
+* Automatic mouse Ensembl ID to gene symbol conversion using local mapping resources.
+* Duplicated gene-symbol detection and merging by summing raw counts.
+* Sample-level quality control with reusable QC grouping sets.
+* Configurable QC visualizations, including library size, detected genes, zero-count fraction, PCA, and sample correlation.
+* PNG and true SVG plot export through Plotly/Kaleido.
+* R/Bioconductor-backed normalization using CPM, log2(CPM + 1), DESeq2 normalized counts, DESeq2 VST, edgeR TMM CPM, and edgeR TMM logCPM.
+* Searchable and paginated normalized matrix preview with manual CSV export.
 
 Planned future features include:
 
-* PCA and sample correlation.
 * DESeq2-based differential expression analysis.
-* Volcano plots.
-* Heatmaps.
-* ORA pathway analysis.
+* DEG result tables and volcano plots.
+* DEG heatmaps and normalized-expression visualization.
+* ORA pathway enrichment analysis.
 * GSEA / fgsea-style pathway analysis.
-* Exportable result reports.
-* Modular project structure for future integration with single-cell analysis tools.
+* Exportable analysis reports.
+* Future modular integration with single-cell analysis tools.
 
 ## Background
 
-The original browser-only HTML prototype was developed as a fast, interactive proof-of-concept for bulk RNA-seq analysis. It included count matrix upload/parsing, sample grouping, gene mapping, QC, normalization, exploratory DEG-style analysis, volcano plots, heatmaps, ORA, and GSEA-style pathway analysis.
-
-The current Python/Streamlit version treats the HTML app as a validated product reference, but rebuilds the workflow with more reproducible Python/R-compatible logic.
+The current Python/Streamlit version treats the previous HTML-based UI version as a validated product reference, but rebuilds the workflow with more reproducible Python/R-compatible logic.
 
 The long-term goal is to build a broader scientific analysis platform that can eventually integrate:
 
@@ -66,13 +56,11 @@ bulk-rnaseq-explorer/
 ├── assets/
 │   └── generated cache files, ignored by Git when appropriate
 ├── database_raw/
-│   └── local GMT pathway databases
+│   └── local GMT pathway database resources
 ├── source_mapping/
 │   └── mouse Ensembl-to-gene-symbol mapping resources
 ├── r_scripts/
 │   └── normalize_counts.R
-├── outputs/
-│   └── normalization/
 ├── bulk_rnaseq_explorer.py
 ├── index_v5.4.9.html
 ├── .gitignore
@@ -87,35 +75,52 @@ bulk_rnaseq_explorer.py
 
 The archived `bulk_rnaseq_explorer_v1_0.py` to `bulk_rnaseq_explorer_v1_5.py` files preserve early migration history.
 
-The current project intentionally still uses one main Python file while the core workflow is being stabilized. A more modular structure can be introduced later after the upload, QC, normalization, DEG, and pathway workflows are stable.
+The current project intentionally still uses one main Python file while the core workflow is being stabilized. A more modular structure can be introduced later after upload, QC, normalization, DEG, and pathway workflows are stable.
 
 ## Installation
 
 Recommended environment: Python 3.10+ in a dedicated Conda environment.
 
-Example:
+Create and activate the environment:
 
 ```bash
 conda create -n rnaseq python=3.10
 conda activate rnaseq
+```
+
+Install Python dependencies:
+
+```bash
 pip install streamlit pandas numpy plotly kaleido
 ```
 
-Optional for faster local gene-map cache:
+Optional, for faster local gene-map cache:
 
 ```bash
 pip install pyarrow
 ```
 
-Normalization requires R and Bioconductor packages:
+Normalization requires local R installation and Rscript availability from terminal PATH.
+
+Install R packages from R or RStudio:
 
 ```r
 install.packages("BiocManager")
-BiocManager::install(c("DESeq2", "edgeR"))
 install.packages("jsonlite")
+BiocManager::install(c("DESeq2", "edgeR"))
 ```
 
-`Rscript` must be available from the terminal PATH.
+Check that Rscript is available:
+
+```bash
+Rscript --version
+```
+
+Check that required R packages can load:
+
+```bash
+Rscript -e "library(DESeq2); library(edgeR); library(jsonlite); sessionInfo()"
+```
 
 ## Running the App
 
@@ -152,57 +157,33 @@ The first column should contain gene identifiers. The remaining columns should c
 
 ### 1. Upload Count Matrix
 
-The upload workflow supports:
+The upload workflow parses the raw count matrix, detects sample columns, identifies the gene ID mode, converts mouse Ensembl IDs to gene symbols when possible, and merges duplicated processed gene symbols by summing raw counts.
 
-* Raw count matrix upload.
-* Automatic sample detection.
-* Gene ID column selection.
-* Gene ID mode detection:
-
-  * Mouse Ensembl ID.
-  * Gene symbol.
-  * Mixed.
-  * Unknown.
-* Mouse Ensembl-to-gene-symbol conversion using local mapping resources.
-* Duplicate gene-symbol detection.
-* Duplicate gene merging by summing raw counts.
-* Processed count matrix generation for downstream analysis.
-
-The processed matrix is the main input for QC and normalization.
+The resulting processed raw count matrix is used for QC and normalization.
 
 ### 2. Quality Control
 
-The QC workflow provides:
+The QC workflow provides sample-level QC summaries, reusable QC grouping sets, and configurable QC plots.
 
-* Sample-level summary table.
-* Reusable QC grouping sets.
-* Library size plot.
-* Detected genes plot.
-* Zero-count fraction plot.
-* Plotting by individual samples or saved QC groups.
-* Group-level aggregation:
+Current QC visualizations include:
 
-  * Mean.
-  * Median.
-  * Sum, when appropriate.
-* Overlay of individual sample dots on group-level bar plots.
-* Plot customization:
+* Library size.
+* Detected genes.
+* Zero-count fraction.
+* PCA using normalized expression matrices.
+* Sample correlation heatmap using normalized expression matrices.
 
-  * Width.
-  * Height.
-  * X-axis label angle.
-  * Axis label font size.
-  * Bar colors.
-* Plot export:
-
-  * PNG.
-  * True SVG through Plotly/Kaleido.
+QC plots support sample-level or saved-group coloring where appropriate, advanced visual settings, color customization, PNG export, and true SVG export.
 
 ### 3. Normalization
 
-The v2.0 normalization workflow adds the first R/Bioconductor-backed normalization module.
+The normalization workflow uses the processed raw count matrix after gene-symbol conversion and duplicate-gene merging.
 
-Normalization uses the processed raw count matrix after gene-symbol conversion and duplicate-gene merging.
+Normalization is performed through R/Bioconductor using:
+
+```text
+r_scripts/normalize_counts.R
+```
 
 The module generates:
 
@@ -210,91 +191,41 @@ The module generates:
 * CPM.
 * log2(CPM + 1).
 * DESeq2 normalized counts.
-* DESeq2 VST matrix.
-* edgeR TMM-normalized CPM.
-* edgeR TMM-normalized logCPM.
+* DESeq2 VST.
+* edgeR TMM CPM.
+* edgeR TMM logCPM.
 
-DESeq2 and edgeR normalization are run through `Rscript` using:
+As of v2.5, normalization results are loaded back into Streamlit memory instead of being automatically exported into a permanent project-level output folder. Users can inspect matrices in the UI and export selected tables manually as CSV.
 
-```text
-r_scripts/normalize_counts.R
-```
+### 4. Normalized Matrix Viewer
 
-The output files are written to session-specific folders under:
+The normalized matrix viewer supports:
 
-```text
-outputs/normalization/
-```
-
-Expected output files include:
-
-```text
-raw_counts.csv
-cpm.csv
-log2_cpm_plus1.csv
-deseq2_size_factors.csv
-deseq2_normalized_counts.csv
-deseq2_vst.csv
-edger_tmm_norm_factors.csv
-edger_tmm_cpm.csv
-edger_tmm_logcpm.csv
-normalization_report.json
-```
-
-The Normalization page includes:
-
-* Matrix summary.
-* Total counts per sample.
-* Non-integer count warnings.
-* Raw-count sanity warnings when applicable.
-* Rscript execution status.
-* DESeq2 size factors table.
-* edgeR TMM normalization factors table.
-* Output matrix dimension summary.
-* Searchable normalized matrix preview.
+* Matrix selection.
+* Gene search after at least 3 typed characters.
+* Matched-gene selection.
 * Previous / Next pagination.
-* Show rows selector.
+* Show rows control.
 * CSV export.
-
-Search behavior:
-
-* Gene search starts only after at least 3 typed characters.
-* Search is case-insensitive.
-* The table viewer shows gene suggestions when matches are found.
-* CSV export downloads the currently search-filtered matrix; without search, it downloads the full selected matrix.
-
-## Output Philosophy
-
-The app separates exploratory UI convenience from reproducible backend outputs.
-
-Current principles:
-
-* Raw count parsing and UI interaction are handled in Python/Streamlit.
-* DESeq2 and edgeR normalization are delegated to R/Bioconductor.
-* Duplicate genes are merged by summing raw counts.
-* All normalization matrices preserve the `Gene` column.
-* Sample order is preserved from the uploaded matrix.
-* R package errors are surfaced clearly in the UI instead of crashing the app.
 
 ## Version History
 
-### v1.0-v1.2: Build initial Streamlit migration skeleton
+### v1.0-v1.2: Initial Streamlit migration
 
 Main changes:
 
 * Created the first Streamlit MVP from the validated HTML prototype.
-* Added count matrix upload and basic input parsing.
-* Added early workflow navigation and local resource detection.
+* Added count matrix upload, basic parsing, workflow navigation, and local resource detection.
 
-### v1.3: Add gene symbol conversion and duplicate merging
+### v1.3: Gene symbol conversion and duplicate merging
 
 Main changes:
 
 * Added mouse Ensembl-to-gene-symbol conversion.
-* Added duplicate gene-symbol detection.
-* Merged duplicated processed genes by summing raw counts.
+* Added duplicate gene-symbol detection and merging by summing raw counts.
+* Generated a processed raw count matrix for downstream workflows.
 
-### v1.4-v1.5: Add Quality Control foundation
+### v1.4-v1.5: Initial Quality Control workflow
 
 Main changes:
 
@@ -302,49 +233,68 @@ Main changes:
 * Added Library Size, Detected Genes, and Zero-count Fraction plots.
 * Added early QC grouping and plot export support.
 
-### v1.6-v1.9: Improve QC grouping and plot controls
+### v1.6-v1.9: QC plot interaction and export refinement
 
 Main changes:
 
-* Improved reusable QC grouping sets.
-* Added group-level plot aggregation with overlaid sample dots.
-* Added advanced plot settings, color settings, reset behavior, and direct PNG/SVG export.
+* Migrated more QC barplot behavior from the previous HTML version.
+* Added sample/group plotting modes, group aggregation, sample-dot overlays, advanced plot settings, and color settings.
+* Improved reset behavior, export caching, and PNG/SVG export.
 
-### v1.10-v1.15: Fix QC action layout and stabilize UI state
-
-Main changes:
-
-* Fixed QC grouping save/reset behavior.
-* Improved Streamlit widget state handling.
-* Cleaned up QC button layout, export buttons, and related UI logic.
-* Preserved true SVG export through Plotly/Kaleido.
-
-### v2.0: Add R-backed normalization workflow
+### v1.10-v1.15: QC layout, grouping stability, and UI polish
 
 Main changes:
 
-* Added a standalone Normalization section.
+* Improved QC grouping save/reset behavior.
+* Stabilized Streamlit widget state handling using reset nonces and cleanup logic.
+* Reworked responsive button layouts and reduced stale state issues.
+* Improved barplot responsiveness and visual consistency.
+
+### v2.0: R/Bioconductor-backed normalization
+
+Main changes:
+
+* Added normalization as an independent workflow section.
 * Added Rscript-based DESeq2 and edgeR normalization.
-* Generated raw counts, CPM, logCPM, DESeq2 normalized counts, DESeq2 VST, edgeR TMM CPM, and edgeR TMM logCPM.
-* Added searchable, paginated normalized matrix preview with CSV export.
-* Added normalization report output with package/version and filtering metadata.
+* Added normalized matrix viewer with search, pagination, and CSV export.
 
-## Roadmap
+### v2.1: Normalization UI simplification and QC performance cleanup
 
-Near-term priorities:
+Main changes:
 
-* Add PCA and sample correlation after normalization.
-* Add DESeq2-based DEG analysis through R.
-* Add DEG result tables and volcano plots.
-* Add heatmap visualization.
-* Add ORA and GSEA / fgsea-style pathway analysis.
-* Improve project/session output organization.
-* Gradually modularize the codebase after the core workflow stabilizes.
+* Removed redundant normalization summary/output displays.
+* Changed normalization to auto-run when valid processed counts are available.
+* Improved matrix viewer controls and reduced repeated QC loading overhead.
 
-Long-term priorities:
+### v2.2: PCA and sample correlation
 
-* Integrate with single-cell RNA-seq analysis tools.
-* Support additional omics and image-based workflows.
-* Add project-level data management.
-* Support local, server, and cloud execution modes.
-* Build toward a broader scientific analysis platform.
+Main changes:
+
+* Added PCA QC plot using normalized expression matrices.
+* Added sample correlation heatmap.
+* Added QC grouping-based coloring and annotation support for PCA and correlation plots.
+
+### v2.3-v2.4: QC view layout and grouping-order fixes
+
+Main changes:
+
+* Reorganized Quality Control into compact selectable views.
+* Removed approximate VST behavior inherited from the HTML prototype.
+* Improved saved QC grouping order preservation in PCA and sample correlation.
+* Improved sample correlation annotation layout and value-label coloring.
+
+### v2.5: Normalization memory workflow and heatmap layout refinement
+
+Main changes:
+
+* Removed permanent automatic normalization output folder generation.
+* Loaded normalization outputs into Streamlit session memory for UI preview and manual CSV export.
+* Further hardened QC grouping editor state to reduce browser autofill/widget-state contamination.
+* Refined sample correlation heatmap layout, annotation bars, and correlation-value overlay behavior.
+
+## License
+
+No license has been selected yet.
+
+This repository is currently private and intended for internal development.
+::: 
